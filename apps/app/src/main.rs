@@ -565,7 +565,7 @@ async fn toggle_decorations(b: bool, window: Window) -> api::Result<()> {
 }
 
 #[tauri::command]
-async fn restart_app(app: tauri::AppHandle) -> api::Result<()> {
+async fn restart_app(app: AppHandle) -> api::Result<()> {
     if theseus::State::initialized()
         && theseus::instance::has_active_backup_operations().await?
     {
@@ -578,7 +578,7 @@ async fn restart_app(app: tauri::AppHandle) -> api::Result<()> {
 }
 
 #[tauri::command]
-async fn exit_app(app: tauri::AppHandle, force: bool) -> api::Result<()> {
+async fn exit_app(app: AppHandle, force: bool) -> api::Result<()> {
     if theseus::State::initialized()
         && theseus::instance::has_active_backup_operations().await?
     {
