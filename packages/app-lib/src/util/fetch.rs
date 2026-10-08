@@ -3147,20 +3147,33 @@ pub(crate) async fn finalize_download(
     part_path: &Path,
     destination: &Path,
 ) -> crate::Result<()> {
-    io::retry_windows_sharing_violation(
-        destination,
-        "finalizing download",
-        || tokio::fs::rename(part_path, destination),
-    )
-    .await
-    .map_err(|error| {
-        io::io_error_with_lock_info_for_paths(
-            error,
+    let mut last_error = None;
+    for attempt in 1..=3 {
+        match io::retry_windows_sharing_violation(
             destination,
-            &[destination, part_path],
+            "finalizing download",
+            || tokio::fs::rename(part_path, destination),
         )
-    })?;
-    Ok(())
+        .await
+        {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                last_error = Some(error);
+                if attempt < 3 {
+                    tokio::time::sleep(time::Duration::from_millis(
+                        500 * attempt,
+                    ))
+                    .await;
+                }
+            }
+        }
+    }
+    Err(io::io_error_with_lock_info_for_paths(
+        last_error.expect("finalization attempts always record an error"),
+        destination,
+        &[destination, part_path],
+    )
+    .into())
 }
 
 pub(crate) fn same_origin(left: &Url, right: &Url) -> bool {
@@ -3291,7 +3304,7 @@ enum SegmentedDownloadOutcome {
         reason: &'static str,
     },
     SwitchRoute(RouteProbeResult),
-    SourceFailed,
+    SourceFailed(Option<u16>),
     IntegrityFailed(crate::Error),
     Fatal(crate::Error),
 }
@@ -4419,6 +4432,7 @@ async fn download_segment_once(
     provider_script_policy: bool,
     request_timeout: time::Duration,
     provider_sources: Option<&Arc<Mutex<ProviderSourceState>>>,
+    cancellation: Option<&tokio_util::sync::CancellationToken>,
 ) -> Result<SegmentDownloadCompletion, SegmentDownloadError> {
     let _activity = crate::State::get_if_initialized()
         .map(|state| state.begin_download_connection());
@@ -4431,6 +4445,9 @@ async fn download_segment_once(
     let mut http_version = None;
     let mut first_data_elapsed = None;
     for attempt in 1..=SEGMENT_RETRY_ATTEMPTS {
+        if cancellation.is_some_and(|token| token.is_cancelled()) {
+            return Err(SegmentDownloadError::Transport);
+        }
         first_data_elapsed = None;
         let requested_start = range.start + {
             let state = range.state.lock();
@@ -4451,7 +4468,9 @@ async fn download_segment_once(
             )
             .await
             .map_err(|error| SegmentDownloadError::Fatal(error.into()))?;
-        let response = tokio::time::timeout(
+        let clients =
+            DownloadClients::for_request(system_client, direct_client);
+        let response_future = tokio::time::timeout(
             if provider_script_policy {
                 request_timeout
             } else {
@@ -4465,11 +4484,20 @@ async fn download_segment_once(
                 download_meta,
                 (!provider_first_stream).then_some(requested_start),
                 (!provider_script_policy).then_some(requested_end),
-                &DownloadClients::for_request(system_client, direct_client),
+                &clients,
                 redirect_target,
             ),
-        )
-        .await;
+        );
+        let response = if let Some(cancellation) = cancellation {
+            tokio::select! {
+                _ = cancellation.cancelled() => {
+                    return Err(SegmentDownloadError::Transport);
+                }
+                response = response_future => response,
+            }
+        } else {
+            response_future.await
+        };
         let (response, response_url) = match response {
             Ok(Ok(response)) => response,
             Ok(Err(_)) | Err(_)
@@ -4579,18 +4607,36 @@ async fn download_segment_once(
         loop {
             let tail_threshold = TAIL_HEDGE_MIN_REMAINING.max(total_size / 10);
             let tail_eligible = range.remaining() <= tail_threshold;
-            let chunk = match tokio::time::timeout(
-                if provider_script_policy {
-                    request_timeout
-                } else if tail_eligible {
-                    TAIL_HEDGE_IDLE_TIMEOUT
-                } else {
-                    RANGE_IDLE_RECONNECT_TIMEOUT
-                },
-                stream.next(),
-            )
-            .await
-            {
+            let next_chunk = if let Some(cancellation) = cancellation {
+                tokio::select! {
+                    _ = cancellation.cancelled() => {
+                        return Err(SegmentDownloadError::Transport);
+                    }
+                    result = tokio::time::timeout(
+                        if provider_script_policy {
+                            request_timeout
+                        } else if tail_eligible {
+                            TAIL_HEDGE_IDLE_TIMEOUT
+                        } else {
+                            RANGE_IDLE_RECONNECT_TIMEOUT
+                        },
+                        stream.next(),
+                    ) => result,
+                }
+            } else {
+                tokio::time::timeout(
+                    if provider_script_policy {
+                        request_timeout
+                    } else if tail_eligible {
+                        TAIL_HEDGE_IDLE_TIMEOUT
+                    } else {
+                        RANGE_IDLE_RECONNECT_TIMEOUT
+                    },
+                    stream.next(),
+                )
+                .await
+            };
+            let chunk = match next_chunk {
                 Ok(Some(chunk)) => chunk,
                 Ok(None) => break,
                 Err(_) if provider_script_policy => {
@@ -4885,6 +4931,7 @@ async fn download_segment(
     request_timeout: time::Duration,
     candidate_routes: &[DownloadRoute],
     provider_sources: Option<Arc<Mutex<ProviderSourceState>>>,
+    cancellation: Option<&tokio_util::sync::CancellationToken>,
 ) -> Result<SegmentDownloadCompletion, SegmentDownloadError> {
     if !provider_script_policy {
         return download_segment_once(
@@ -4910,6 +4957,7 @@ async fn download_segment(
             false,
             request_timeout,
             None,
+            cancellation,
         )
         .await;
     }
@@ -4917,6 +4965,9 @@ async fn download_segment(
     let mut permit = Some(permit);
     let mut last_error = None;
     for candidate in std::iter::once(route).chain(candidate_routes.iter()) {
+        if cancellation.is_some_and(|token| token.is_cancelled()) {
+            return Err(SegmentDownloadError::Transport);
+        }
         if provider_sources
             .as_ref()
             .is_some_and(|sources| sources.lock().is_disabled(candidate))
@@ -4925,8 +4976,16 @@ async fn download_segment(
         }
         let current_permit = match permit.take() {
             Some(permit) => permit,
-            None => match acquire_native_connection(candidate, semaphore).await
-            {
+            None => match if let Some(cancellation) = cancellation {
+                tokio::select! {
+                    _ = cancellation.cancelled() => {
+                        return Err(SegmentDownloadError::Transport);
+                    }
+                    result = acquire_native_connection(candidate, semaphore) => result,
+                }
+            } else {
+                acquire_native_connection(candidate, semaphore).await
+            } {
                 Ok(permit) => permit,
                 Err(error) => {
                     return Err(SegmentDownloadError::Fatal(error));
@@ -4960,6 +5019,7 @@ async fn download_segment(
             true,
             candidate_timeout,
             provider_sources.as_ref(),
+            cancellation,
         )
         .await
         {
@@ -5016,6 +5076,7 @@ struct SegmentedDownloadContext<'a> {
     allow_low_throughput_abort: bool,
     request_timeout: time::Duration,
     provider_sources: Option<Arc<Mutex<ProviderSourceState>>>,
+    cancellation: Option<&'a tokio_util::sync::CancellationToken>,
 }
 
 async fn finalize_segmented_output(
@@ -5119,6 +5180,7 @@ impl<'a> SegmentedDownloadContext<'a> {
                 FILE_TRANSFER_FIRST_BYTE_TIMEOUT
             },
             provider_sources: None,
+            cancellation: request.cancellation.as_ref(),
         }
     }
 
@@ -5155,6 +5217,7 @@ async fn try_segmented_download(
         allow_low_throughput_abort,
         request_timeout,
         provider_sources,
+        cancellation,
     } = context;
     let configured_limit = configured_semaphore_limit(semaphore);
     let route_cap = if request.provider_script_policy {
@@ -5265,6 +5328,7 @@ async fn try_segmented_download(
             request_timeout,
             candidate_routes,
             provider_sources.clone(),
+            cancellation,
         ));
     }
     tracing::debug!(
@@ -5330,6 +5394,17 @@ async fn try_segmented_download(
                         }
                     }
                 }
+            }
+            _ = async {
+                request
+                    .cancellation
+                    .as_ref()
+                    .expect("cancellation branch is guarded")
+                    .cancelled()
+                    .await
+            }, if request.cancellation.is_some() => {
+                segment_error = Some(SegmentDownloadError::Transport);
+                break;
             }
             probe = async {
                 alternate_probe
@@ -5403,6 +5478,7 @@ async fn try_segmented_download(
                             request_timeout,
                             candidate_routes,
                             provider_sources.clone(),
+                            cancellation,
                         ));
                         ranges.push(new_range);
                     }
@@ -5555,6 +5631,7 @@ async fn try_segmented_download(
                             request_timeout,
                             candidate_routes,
                             provider_sources.clone(),
+                            cancellation,
                         ));
                         ranges.push(new_range);
                         expansion_baseline = Some(snapshot.recent_average);
@@ -5581,9 +5658,14 @@ async fn try_segmented_download(
                     reason,
                 }
             }
-            SegmentDownloadError::Transport
-            | SegmentDownloadError::TransportStatus(_) => {
-                SegmentedDownloadOutcome::SourceFailed
+            SegmentDownloadError::Transport => {
+                SegmentedDownloadOutcome::SourceFailed(None)
+            }
+            SegmentDownloadError::TransportStatus(status) => {
+                // Preserve HTTP status based source policy. In particular,
+                // 404/502 and non-BMCLAPI 403/429 disable a source
+                // immediately, while BMCLAPI rate limits stay retryable.
+                SegmentedDownloadOutcome::SourceFailed(Some(status))
             }
             SegmentDownloadError::Fatal(error) => {
                 SegmentedDownloadOutcome::Fatal(error)
@@ -5775,6 +5857,9 @@ fn build_download_routes(
         let mut seen = HashSet::new();
         return urls
             .into_iter()
+            .map(|url| {
+                super::download::provider_policy::normalize_provider_url(&url)
+            })
             .filter(|url| seen.insert(url.clone()))
             .map(|url| {
                 super::download::provider_policy::exact_provider_route(
@@ -6375,13 +6460,21 @@ async fn try_segmented_native_attempt(
                     disable_range_splitting(route);
                 }
             }
-            SegmentedDownloadOutcome::SourceFailed => {
+            SegmentedDownloadOutcome::SourceFailed(status) => {
                 record_route_failure(route, request.resource, None);
                 record_native_transfer_failure(route, None);
-                let error: crate::Error = ErrorKind::OtherError(format!(
-                    "File transfer failed from {log_url}"
-                ))
-                .into();
+                let error: crate::Error = status
+                    .map(|status| ErrorKind::HttpError {
+                        status,
+                        method: "GET".to_string(),
+                        url: sanitize_url_for_log(&route.url),
+                    })
+                    .unwrap_or_else(|| {
+                        ErrorKind::OtherError(format!(
+                            "File transfer failed from {log_url}"
+                        ))
+                    })
+                    .into();
                 push_download_attempt_diagnostic(
                     &mut session.attempt_history,
                     route,
@@ -6489,6 +6582,7 @@ struct NativeDownloadSession {
     busted_for_route: Option<(usize, String)>,
     file_attempt_budget: usize,
     provider_sources: Arc<Mutex<ProviderSourceState>>,
+    provider_fallback_pending: bool,
 }
 
 impl NativeDownloadSession {
@@ -6513,6 +6607,7 @@ impl NativeDownloadSession {
                 provider_sources: Arc::new(Mutex::new(
                     ProviderSourceState::default(),
                 )),
+                provider_fallback_pending: false,
             },
             h2_failed_nonofficial,
         )
@@ -6623,11 +6718,12 @@ async fn run_native_download_attempts(
     };
     for round in 0..round_count {
         let retry_with_single_thread = if request.provider_script_policy {
-            round == script_retry_limit
+            round == script_retry_limit || session.provider_fallback_pending
         } else {
             round > 0
         };
         if request.provider_script_policy && retry_with_single_thread {
+            session.provider_fallback_pending = false;
             session.terminal_routes.clear();
             remove_if_exists(&part_path).await?;
             remove_if_exists(&super::download::range_journal::path(&part_path))
@@ -6637,6 +6733,12 @@ async fn run_native_download_attempts(
         }
         let mut attempted_routes = Vec::new();
         for (route_index, route) in routes.iter().enumerate() {
+            if request.provider_script_policy
+                && session.provider_fallback_pending
+                && !retry_with_single_thread
+            {
+                break;
+            }
             if request.provider_script_policy
                 && !retry_with_single_thread
                 && session.provider_source_is_disabled(route)
@@ -6739,6 +6841,7 @@ async fn run_native_download_attempts(
             }
         }
         if round + 1 < round_count
+            && !session.provider_fallback_pending
             && routes
                 .iter()
                 .any(|route| !session.terminal_routes.contains(&route.url))
@@ -7490,7 +7593,9 @@ async fn run_native_route_attempts(
                             if remaining == 0 {
                                 break;
                             }
-                            &packet[..packet.len().min(remaining as usize)]
+                            &packet[..packet.len().min(
+                                usize::try_from(remaining).unwrap_or(usize::MAX),
+                            )]
                         } else {
                             packet
                         };
@@ -7550,6 +7655,20 @@ async fn run_native_route_attempts(
                     if provider_transfer_size.flatten().is_some_and(|limit| downloaded >= limit) {
                         break;
                     }
+                }
+                _ = async {
+                    request
+                        .cancellation
+                        .as_ref()
+                        .expect("cancellation branch is guarded")
+                        .cancelled()
+                        .await
+                }, if request.cancellation.is_some() => {
+                    transfer_error = Some(
+                        ErrorKind::OtherError("download canceled".to_string())
+                            .into(),
+                    );
+                    break;
                 }
                 _ = throughput_timer.tick() => {
                     let slow_decision = slow_policy.observe_with_pressure(
@@ -7798,6 +7917,7 @@ async fn run_native_route_attempts(
             if request.provider_script_policy {
                 remove_if_exists(part_path).await?;
                 session.mark_provider_source_fatal(route);
+                session.provider_fallback_pending = true;
                 record_download_attempt_failure(
                     &mut session.attempt_history,
                     route,
@@ -7890,6 +8010,7 @@ async fn run_native_route_attempts(
             if request.provider_script_policy {
                 remove_if_exists(part_path).await?;
                 session.mark_provider_source_fatal(route);
+                session.provider_fallback_pending = true;
                 session.last_error = Some(error);
                 break;
             }
@@ -10346,6 +10467,7 @@ mod tests {
             false,
             FILE_TRANSFER_FIRST_BYTE_TIMEOUT,
             &[],
+            None,
             None,
         )
         .await;

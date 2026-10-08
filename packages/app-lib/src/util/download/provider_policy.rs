@@ -16,6 +16,14 @@ pub(crate) fn curseforge_candidate_urls(url: &str) -> Vec<String> {
     deduplicate(candidates.to_vec())
 }
 
+pub(crate) fn normalize_provider_url(url: &str) -> String {
+    let mut url = url.replace(['\r', '\n'], "").trim().to_string();
+    if url.ends_with("{CDN}") {
+        url = url.replace("{CDN}", "").replace(' ', "%20");
+    }
+    url
+}
+
 pub(crate) fn curseforge_download_urls(url: &str) -> Vec<String> {
     deduplicate(
         std::iter::once(url.to_string())
@@ -170,6 +178,16 @@ mod tests {
                 "https://edge.forgecdn.net/files/1/2/example.jar",
                 "https://mediafilez.forgecdn.net/files/1/2/example.jar",
             ]
+        );
+    }
+
+    #[test]
+    fn provider_urls_strip_script_cdn_markers_and_line_breaks() {
+        assert_eq!(
+            normalize_provider_url(
+                " https://edge.forgecdn.net/files/a b.jar{CDN}\r\n"
+            ),
+            "https://edge.forgecdn.net/files/a%20b.jar"
         );
     }
 
