@@ -563,6 +563,12 @@ function isEditableTarget(target: EventTarget | null) {
     )
 }
 
+/** Let the WebView provide its edit menu when text has been selected. */
+function hasTextSelection() {
+    const selection = window.getSelection()
+    return selection !== null && !selection.isCollapsed
+}
+
 function scrollsAtOwnLevel(element: Element) {
     const { overflowY } = getComputedStyle(element)
     return /(auto|scroll|overlay)/.test(overflowY) && element.scrollHeight > element.clientHeight
@@ -1551,12 +1557,12 @@ async function setupApp() {
     })
 
     if (!dev) {
-        // Keep the native edit menu on inputs while suppressing the WebView menu
-        // elsewhere in the launcher.
+        // Keep the native edit menu on editable targets and selected text while
+        // suppressing the WebView menu elsewhere in the launcher.
         document.addEventListener(
             'contextmenu',
             (event) => {
-                if (!isEditableTarget(event.target)) event.preventDefault()
+                if (!isEditableTarget(event.target) && !hasTextSelection()) event.preventDefault()
             },
             { capture: true },
         )
