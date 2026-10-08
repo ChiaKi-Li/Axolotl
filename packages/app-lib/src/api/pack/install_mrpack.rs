@@ -1246,6 +1246,7 @@ pub(crate) async fn install_zipped_mrpack_files_with_reporter(
             .iter()
             .map(|&index| (index, pack_files[index].clone()))
             .collect::<Vec<_>>();
+        let provider_batch_size = tasks.len().max(1);
         let finalize_semaphore =
             Arc::new(Semaphore::new(NATIVE_CONTENT_FINALIZE_CONCURRENCY));
         let (completion_tx, mut completion_rx) =
@@ -1654,6 +1655,7 @@ pub(crate) async fn install_zipped_mrpack_files_with_reporter(
                 let download = match download_to_path(
                     DownloadRequest::new(primary_url, ResourceClass::Modpack)
                         .with_provider_script_policy()
+                        .with_provider_batch_size(provider_batch_size)
                         .with_provider_browser_headers()
                         .with_exact_candidate_urls(
                             download_urls.iter().skip(1).cloned(),

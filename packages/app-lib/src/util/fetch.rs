@@ -13,7 +13,7 @@ use crate::{ErrorKind, LabrinthError};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use eyre::{Context, eyre};
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use parking_lot::Mutex;
 use rand::Rng;
 use reqwest::{Method, StatusCode, header};
@@ -263,6 +263,7 @@ pub struct DownloadRequest {
     pub candidate_urls: Vec<String>,
     pub(crate) preserve_candidate_order: bool,
     pub(crate) provider_script_policy: bool,
+    pub(crate) provider_batch_size: usize,
     /// Whether range-segmented (multi-connection) downloading is allowed.
     /// Batch schedulers disable it so many small files share one connection
     /// budget instead of each file multiplying its connections.
@@ -296,6 +297,7 @@ impl DownloadRequest {
             candidate_urls: Vec::new(),
             preserve_candidate_order: false,
             provider_script_policy: false,
+            provider_batch_size: 1,
             allow_segmented_download: true,
             allow_http1_segmented_download: true,
             h2_range_concurrency: None,
@@ -374,6 +376,14 @@ impl DownloadRequest {
             ),
             ("referer".to_string(), PROVIDER_SCRIPT_REFERER.to_string()),
         ];
+        self
+    }
+
+    pub(crate) fn with_provider_batch_size(
+        mut self,
+        file_count: usize,
+    ) -> Self {
+        self.provider_batch_size = file_count.max(1);
         self
     }
 
@@ -1044,6 +1054,8 @@ struct ProviderBatchState {
     speed: DownloadSpeedTracker,
     connect_samples: Mutex<Vec<time::Duration>>,
     next_bmclapi_launch: Mutex<Instant>,
+    failures_in_row: AtomicUsize,
+    failure_limit: AtomicUsize,
 }
 
 static PROVIDER_BATCH_STATE: LazyLock<ProviderBatchState> =
@@ -1052,16 +1064,32 @@ static PROVIDER_BATCH_STATE: LazyLock<ProviderBatchState> =
         speed: DownloadSpeedTracker::default(),
         connect_samples: Mutex::new(Vec::new()),
         next_bmclapi_launch: Mutex::new(Instant::now()),
+        failures_in_row: AtomicUsize::new(0),
+        failure_limit: AtomicUsize::new(8),
     });
 
 struct ProviderBatchGuard;
 
 impl ProviderBatchGuard {
-    fn acquire() -> Self {
+    fn acquire(file_count: usize, thread_limit: usize) -> Self {
+        let limit = file_count
+            .saturating_mul(8)
+            .max(thread_limit.saturating_mul(8).saturating_add(3))
+            .clamp(8, 10_000);
         if PROVIDER_BATCH_STATE.active.fetch_add(1, Ordering::AcqRel) == 0 {
             PROVIDER_BATCH_STATE.speed.reset();
             PROVIDER_BATCH_STATE.connect_samples.lock().clear();
             *PROVIDER_BATCH_STATE.next_bmclapi_launch.lock() = Instant::now();
+            PROVIDER_BATCH_STATE
+                .failures_in_row
+                .store(0, Ordering::Release);
+            PROVIDER_BATCH_STATE
+                .failure_limit
+                .store(limit, Ordering::Release);
+        } else {
+            PROVIDER_BATCH_STATE
+                .failure_limit
+                .fetch_max(limit, Ordering::AcqRel);
         }
         Self
     }
@@ -1103,6 +1131,30 @@ fn provider_batch_average_connect() -> Option<time::Duration> {
     Some(time::Duration::from_millis(
         (total_ms / samples.len() as u128).min(u128::from(u64::MAX)) as u64,
     ))
+}
+
+fn provider_batch_record_data() {
+    if PROVIDER_BATCH_STATE.active.load(Ordering::Acquire) != 0 {
+        PROVIDER_BATCH_STATE
+            .failures_in_row
+            .store(0, Ordering::Release);
+    }
+}
+
+fn provider_batch_record_failure() -> bool {
+    if PROVIDER_BATCH_STATE.active.load(Ordering::Acquire) == 0 {
+        return false;
+    }
+    let failures = PROVIDER_BATCH_STATE
+        .failures_in_row
+        .fetch_add(1, Ordering::AcqRel)
+        .saturating_add(1);
+    failures >= PROVIDER_BATCH_STATE.failure_limit.load(Ordering::Acquire)
+}
+
+fn provider_batch_failure_budget_exhausted() -> bool {
+    PROVIDER_BATCH_STATE.failures_in_row.load(Ordering::Acquire)
+        >= PROVIDER_BATCH_STATE.failure_limit.load(Ordering::Acquire)
 }
 
 async fn wait_provider_launch(
@@ -3333,6 +3385,10 @@ impl DownloadRange {
         self.state.lock().active
     }
 
+    fn reactivate(&self) {
+        self.state.lock().active = true;
+    }
+
     fn has_received_data(&self) -> bool {
         self.state.lock().downloaded > 0
     }
@@ -3473,6 +3529,7 @@ impl ProviderSourceState {
     fn record_data(&mut self, route: &DownloadRoute, bytes: u64) {
         self.received_bytes = self.received_bytes.saturating_add(bytes);
         self.failures_in_row = 0;
+        provider_batch_record_data();
         if let Some(source) = self.sources.get_mut(&route.url) {
             source.failures = 0;
         }
@@ -3494,6 +3551,9 @@ impl ProviderSourceState {
             .saturating_add(3)
             .clamp(8, 10_000) as u32;
         if self.failures_in_row >= failure_limit {
+            self.failure_budget_exhausted = true;
+        }
+        if provider_batch_record_failure() {
             self.failure_budget_exhausted = true;
         }
         let detail = message.unwrap_or_default().to_ascii_lowercase();
@@ -3519,6 +3579,7 @@ impl ProviderSourceState {
 
     fn failure_budget_exhausted(&self) -> bool {
         self.failure_budget_exhausted
+            || provider_batch_failure_budget_exhausted()
     }
 }
 
@@ -5045,139 +5106,82 @@ async fn download_segment(
     hedge_active: &AtomicBool,
     provider_script_policy: bool,
     request_timeout: time::Duration,
-    candidate_routes: &[DownloadRoute],
+    _candidate_routes: &[DownloadRoute],
     provider_sources: Option<Arc<Mutex<ProviderSourceState>>>,
     cancellation: Option<&tokio_util::sync::CancellationToken>,
 ) -> Result<SegmentDownloadCompletion, SegmentDownloadError> {
-    if !provider_script_policy {
-        return download_segment_once(
-            route,
-            range,
-            total_size,
-            custom_header,
-            provider_headers,
-            credentials,
-            download_meta,
-            part_path,
-            output,
-            permit,
-            system_client,
-            direct_client,
-            progress,
-            speed,
-            validator,
-            redirect_target,
-            semaphore,
-            hedge_count,
-            hedge_active,
-            false,
-            request_timeout,
-            None,
-            cancellation,
-        )
-        .await;
-    }
-
-    let mut permit = Some(permit);
-    let mut last_error = None;
-    for candidate in std::iter::once(route).chain(candidate_routes.iter()) {
+    if provider_script_policy {
         if cancellation.is_some_and(|token| token.is_cancelled()) {
             return Err(SegmentDownloadError::Transport);
         }
         if provider_sources
             .as_ref()
-            .is_some_and(|sources| sources.lock().is_disabled(candidate))
+            .is_some_and(|sources| sources.lock().is_disabled(route))
         {
-            continue;
-        }
-        if !wait_provider_launch(candidate, cancellation).await {
             return Err(SegmentDownloadError::Transport);
         }
-        let current_permit = match permit.take() {
-            Some(permit) => permit,
-            None => match if let Some(cancellation) = cancellation {
-                tokio::select! {
-                    _ = cancellation.cancelled() => {
-                        return Err(SegmentDownloadError::Transport);
+        if !wait_provider_launch(route, cancellation).await {
+            return Err(SegmentDownloadError::Transport);
+        }
+    }
+    let candidate_timeout = provider_sources
+        .as_ref()
+        .map(|sources| sources.lock().timeout_for(route))
+        .unwrap_or(request_timeout);
+    let result = download_segment_once(
+        route,
+        range,
+        total_size,
+        custom_header,
+        provider_headers,
+        credentials,
+        download_meta,
+        part_path,
+        output,
+        permit,
+        system_client,
+        direct_client,
+        progress,
+        speed,
+        validator,
+        redirect_target,
+        semaphore,
+        hedge_count,
+        hedge_active,
+        provider_script_policy,
+        candidate_timeout,
+        provider_sources.as_ref(),
+        cancellation,
+    )
+    .await;
+    if provider_script_policy {
+        if let Err(error) = &result {
+            if let Some(provider_sources) = provider_sources.as_ref() {
+                let (status, message, protocol_fatal) = match error {
+                    SegmentDownloadError::Protocol(reason) => (
+                        None,
+                        Some(*reason),
+                        !matches!(*reason, "provider initial size unknown"),
+                    ),
+                    SegmentDownloadError::TransportStatus(status) => {
+                        (Some(*status), None, false)
                     }
-                    result = acquire_native_connection(candidate, semaphore) => result,
-                }
-            } else {
-                acquire_native_connection(candidate, semaphore).await
-            } {
-                Ok(permit) => permit,
-                Err(error) => {
-                    return Err(SegmentDownloadError::Fatal(error));
-                }
-            },
-        };
-        let candidate_timeout = provider_sources
-            .as_ref()
-            .map(|sources| sources.lock().timeout_for(candidate))
-            .unwrap_or(request_timeout);
-        match download_segment_once(
-            candidate,
-            range.clone(),
-            total_size,
-            custom_header,
-            provider_headers,
-            credentials,
-            download_meta,
-            part_path,
-            output,
-            current_permit,
-            system_client,
-            direct_client,
-            progress.clone(),
-            speed,
-            validator,
-            redirect_target,
-            semaphore,
-            hedge_count,
-            hedge_active,
-            true,
-            candidate_timeout,
-            provider_sources.as_ref(),
-            cancellation,
-        )
-        .await
-        {
-            Ok(completion) => return Ok(completion),
-            Err(error @ SegmentDownloadError::Fatal(_)) => {
-                return Err(error);
-            }
-            Err(error) => {
-                if let SegmentDownloadError::Protocol(reason) = &error
-                    && *reason == "provider initial size unknown"
-                {
-                    return Err(error);
-                }
-                if let Some(provider_sources) = provider_sources.as_ref() {
-                    let (status, message, protocol_fatal) = match &error {
-                        SegmentDownloadError::Protocol(reason) => (
-                            None,
-                            Some(*reason),
-                            !matches!(*reason, "provider initial size unknown"),
-                        ),
-                        SegmentDownloadError::TransportStatus(status) => {
-                            (Some(*status), None, false)
-                        }
-                        SegmentDownloadError::Transport => (None, None, false),
-                        SegmentDownloadError::Fatal(_) => unreachable!(),
-                    };
+                    SegmentDownloadError::Transport => (None, None, false),
+                    SegmentDownloadError::Fatal(_) => (None, None, false),
+                };
+                if !matches!(error, SegmentDownloadError::Fatal(_)) {
                     provider_sources.lock().record_failure(
-                        candidate,
+                        route,
                         status,
                         message,
                         protocol_fatal,
                         configured_semaphore_limit(semaphore),
                     );
                 }
-                last_error = Some(error)
             }
         }
     }
-    Err(last_error.unwrap_or(SegmentDownloadError::Transport))
+    result
 }
 
 struct SegmentedDownloadContext<'a> {
@@ -5424,37 +5428,49 @@ async fn try_segmented_download(
     let redirect_target = AsyncMutex::new(None);
     let hedge_count = AtomicUsize::new(0);
     let hedge_active = AtomicBool::new(false);
-    let mut downloads = futures::stream::FuturesUnordered::new();
     let mut ranges = create_initial_ranges(size, permits.len());
+    let provider_routes = std::iter::once(route.clone())
+        .chain(candidate_routes.iter().cloned())
+        .collect::<Vec<_>>();
+    let mut range_route_indices = ranges
+        .iter()
+        .map(|range| (range.index, 0usize))
+        .collect::<HashMap<_, _>>();
+    let mut downloads = futures::stream::FuturesUnordered::new();
     let mut provider_pause_until = Instant::now();
     for (range, permit) in ranges.iter().cloned().zip(permits) {
-        downloads.push(download_segment(
-            route,
-            range,
-            size,
-            request.header.as_ref(),
-            request.provider_headers.as_slice(),
-            credentials,
-            request.download_meta.as_ref(),
-            part_path,
-            &output,
-            permit,
-            system_client,
-            direct_client,
-            progress_tx.clone(),
-            &speed,
-            &validator,
-            (route.source == DownloadRouteSource::Mcim)
-                .then_some(&redirect_target),
-            semaphore,
-            &hedge_count,
-            &hedge_active,
-            request.provider_script_policy,
-            request_timeout,
-            candidate_routes,
-            provider_sources.clone(),
-            cancellation,
-        ));
+        let work_range = range.clone();
+        downloads.push(
+            download_segment(
+                route,
+                range,
+                size,
+                request.header.as_ref(),
+                request.provider_headers.as_slice(),
+                credentials,
+                request.download_meta.as_ref(),
+                part_path,
+                &output,
+                permit,
+                system_client,
+                direct_client,
+                progress_tx.clone(),
+                &speed,
+                &validator,
+                (route.source == DownloadRouteSource::Mcim)
+                    .then_some(&redirect_target),
+                semaphore,
+                &hedge_count,
+                &hedge_active,
+                request.provider_script_policy,
+                request_timeout,
+                candidate_routes,
+                provider_sources.clone(),
+                cancellation,
+            )
+            .map(move |result| (work_range, result))
+            .boxed(),
+        );
     }
     if request.provider_script_policy
         && route.url.to_ascii_lowercase().contains("bmclapi")
@@ -5484,6 +5500,7 @@ async fn try_segmented_download(
     let mut expansion_baseline = None;
     let mut expansion_exhausted = false;
     let mut last_block_reason = None;
+    let mut retry_queue = VecDeque::<(DownloadRange, usize)>::new();
     let mut downloaded = 0_u64;
     let mut slow_policy =
         crate::util::download::native_slow::NativeSlowPolicy::new(
@@ -5498,7 +5515,7 @@ async fn try_segmented_download(
     let mut initial_ttfb = None;
     let mut remote_addr = None;
     let mut http_version = None;
-    while !downloads.is_empty() {
+    while !downloads.is_empty() || !retry_queue.is_empty() {
         tokio::select! {
             Some(delta) = progress_rx.recv() => {
                 downloaded = downloaded.saturating_add(delta);
@@ -5509,8 +5526,9 @@ async fn try_segmented_download(
                     tracing::warn!(%error, "Download progress callback failed");
                 }
             }
-            result = downloads.next() => {
+            result = downloads.next(), if !downloads.is_empty() => {
                 if let Some(result) = result {
+                    let (range, result) = result;
                     match result {
                         Ok(completion) if completion.is_first_range => {
                             final_url = Some(completion.final_url);
@@ -5520,6 +5538,51 @@ async fn try_segmented_download(
                         }
                         Ok(_) => {}
                         Err(error) => {
+                            if matches!(
+                                &error,
+                                SegmentDownloadError::Protocol(
+                                    "provider initial size unknown"
+                                )
+                            ) {
+                                segment_error = Some(error);
+                                break;
+                            }
+                            if request.provider_script_policy
+                                && !provider_sources
+                                    .as_ref()
+                                    .is_some_and(|sources| {
+                                        sources.lock().failure_budget_exhausted()
+                                    })
+                            {
+                                let current_index = range_route_indices
+                                    .get(&range.index)
+                                    .copied()
+                                    .unwrap_or_default();
+                                let next_index = (1..=provider_routes.len())
+                                    .map(|offset| {
+                                        (current_index + offset)
+                                            % provider_routes.len().max(1)
+                                    })
+                                    .find(|index| {
+                                        provider_sources
+                                            .as_ref()
+                                            .is_none_or(|sources| {
+                                                !sources
+                                                    .lock()
+                                                    .is_disabled(&provider_routes[*index])
+                                            })
+                                    });
+                                if let Some(next_index) = next_index {
+                                    range.reactivate();
+                                    range_route_indices
+                                        .insert(range.index, next_index);
+                                    retry_queue.push_back((
+                                        range.clone(),
+                                        next_index,
+                                    ));
+                                    continue;
+                                }
+                            }
                             segment_error = Some(error);
                             break;
                         }
@@ -5561,6 +5624,51 @@ async fn try_segmented_download(
             }
             _ = scheduler.tick() => {
                 if request.provider_script_policy {
+                    if let Some((retry_range, retry_index)) =
+                        retry_queue.pop_front()
+                    {
+                        if let Some(permit) = try_acquire_native_connection(
+                            &provider_routes[retry_index],
+                            semaphore,
+                        ) {
+                            let retry_route = &provider_routes[retry_index];
+                            let work_range = retry_range.clone();
+                            downloads.push(
+                                download_segment(
+                                    retry_route,
+                                    retry_range,
+                                    size,
+                                    request.header.as_ref(),
+                                    request.provider_headers.as_slice(),
+                                    credentials,
+                                    request.download_meta.as_ref(),
+                                    part_path,
+                                    &output,
+                                    permit,
+                                    system_client,
+                                    direct_client,
+                                    progress_tx.clone(),
+                                    &speed,
+                                    &validator,
+                                    (retry_route.source
+                                        == DownloadRouteSource::Mcim)
+                                        .then_some(&redirect_target),
+                                    semaphore,
+                                    &hedge_count,
+                                    &hedge_active,
+                                    true,
+                                    request_timeout,
+                                    &provider_routes[1..],
+                                    provider_sources.clone(),
+                                    cancellation,
+                                )
+                                .map(move |result| (work_range, result))
+                                .boxed(),
+                            );
+                        } else {
+                            retry_queue.push_front((retry_range, retry_index));
+                        }
+                    }
                     if Instant::now() < provider_pause_until {
                         continue;
                     }
@@ -5595,6 +5703,7 @@ async fn try_segmented_download(
                             range.split_tail(next_range_index)
                     {
                         next_range_index += 1;
+                        let work_range = new_range.clone();
                         downloads.push(download_segment(
                             route,
                             new_range.clone(),
@@ -5621,7 +5730,15 @@ async fn try_segmented_download(
                             candidate_routes,
                             provider_sources.clone(),
                             cancellation,
-                        ));
+                        )
+                        .map(move |result| (work_range, result))
+                        .boxed());
+                        if let Some(route_index) =
+                            range_route_indices.get(&range.index).copied()
+                        {
+                            range_route_indices
+                                .insert(new_range.index, route_index);
+                        }
                         ranges.push(new_range);
                         if route.url.to_ascii_lowercase().contains("bmclapi") {
                             provider_pause_until =
@@ -5752,6 +5869,7 @@ async fn try_segmented_download(
                             "Starting an additional download range"
                         );
                         next_range_index += 1;
+                        let work_range = new_range.clone();
                         downloads.push(download_segment(
                             route,
                             new_range.clone(),
@@ -5778,7 +5896,15 @@ async fn try_segmented_download(
                             candidate_routes,
                             provider_sources.clone(),
                             cancellation,
-                        ));
+                        )
+                        .map(move |result| (work_range, result))
+                        .boxed());
+                        if let Some(route_index) =
+                            range_route_indices.get(&range.index).copied()
+                        {
+                            range_route_indices
+                                .insert(new_range.index, route_index);
+                        }
                         ranges.push(new_range);
                         expansion_baseline = Some(snapshot.recent_average);
                         last_expansion = Instant::now();
@@ -6354,9 +6480,12 @@ async fn download_to_path_inner(
         wait_ms = lock_started.elapsed().as_millis(),
         "Acquired destination download lock"
     );
-    let _provider_batch = request
-        .provider_script_policy
-        .then(ProviderBatchGuard::acquire);
+    let _provider_batch = request.provider_script_policy.then(|| {
+        ProviderBatchGuard::acquire(
+            request.provider_batch_size,
+            configured_semaphore_limit(semaphore),
+        )
+    });
     let mode = source_mode_for_resource(request.resource);
     let mut routes = build_download_routes(&request, mode);
     let part_path = suffixed_path(destination, ".part");
