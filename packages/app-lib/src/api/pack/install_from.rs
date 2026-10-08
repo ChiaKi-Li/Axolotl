@@ -177,6 +177,7 @@ pub struct CreatePackDescription {
     pub version_id: Option<String>,
     pub instance_id: String,
     pub source_filename: Option<String>,
+    pub modrinth_api_latency: Option<std::time::Duration>,
 }
 
 pub async fn get_instance_from_pack(
@@ -259,6 +260,7 @@ pub(crate) async fn generate_pack_from_version_id_with_reporter(
     let state = State::get().await?;
     let has_icon_url = icon_url.is_some();
 
+    let api_started = tokio::time::Instant::now();
     let version = CachedEntry::get_version(
         &ModrinthVersionId::new(version_id.clone())?,
         Some(CacheBehaviour::Bypass),
@@ -271,6 +273,7 @@ pub(crate) async fn generate_pack_from_version_id_with_reporter(
             "Invalid version ID specified!".to_string(),
         )
     })?;
+    let modrinth_api_latency = api_started.elapsed();
 
     // Update instance with correct loader and game version from the API version metadata,
     // so the UI shows accurate info while the pack file is still downloading.
@@ -308,6 +311,19 @@ pub(crate) async fn generate_pack_from_version_id_with_reporter(
                 "Specified version has no files".to_string(),
             )
         })?;
+    let pack_urls =
+        crate::util::download::provider_policy::modrinth_resource_urls(
+            std::slice::from_ref(&pack_file.url),
+            version.game_versions.first().map(String::as_str),
+            version.loaders.first().map(String::as_str),
+            Some(modrinth_api_latency),
+        );
+    let Some(primary_pack_url) = pack_urls.first() else {
+        return Err(crate::ErrorKind::InputError(
+            "Modrinth returned an empty modpack URL list".to_string(),
+        )
+        .into());
+    };
     let file_name = Path::new(&pack_file.filename);
     if file_name.components().count() != 1
         || !matches!(file_name.components().next(), Some(Component::Normal(_)))
@@ -380,7 +396,7 @@ pub(crate) async fn generate_pack_from_version_id_with_reporter(
     let progress = Some(&mut progress as &mut FetchProgressFn<'_>);
 
     let context = InstallErrorContext::new("download modpack file")
-        .urls(vec![pack_file.url.clone()])
+        .urls(pack_urls.clone())
         .maybe_expected_hash(hash.cloned())
         .expected_size(pack_file.size as u64)
         .target_path(pack_path.display().to_string())
@@ -407,12 +423,13 @@ pub(crate) async fn generate_pack_from_version_id_with_reporter(
         .await?;
     reporter.persist().await?;
     let download_result = download_to_path(
-        DownloadRequest::new(&pack_file.url, ResourceClass::Modpack)
+        DownloadRequest::new(primary_pack_url, ResourceClass::Modpack)
+            .with_exact_candidate_urls(pack_urls.iter().skip(1).cloned())
             .with_integrity(Integrity {
                 size: Some(pack_file.size as u64),
                 sha1: hash.cloned(),
                 sha512: pack_file.hashes.get("sha512").cloned(),
-                content: ContentValidation::Jar,
+                content: ContentValidation::None,
                 ..Integrity::default()
             })
             .with_h2_range_concurrency(16)
@@ -519,6 +536,7 @@ pub(crate) async fn generate_pack_from_version_id_with_reporter(
             version_id: Some(version_id),
             instance_id,
             source_filename: None,
+            modrinth_api_latency: Some(modrinth_api_latency),
         },
     })
 }
@@ -541,6 +559,7 @@ pub async fn generate_pack_from_file(
             version_id: None,
             instance_id,
             source_filename,
+            modrinth_api_latency: None,
         },
     })
 }

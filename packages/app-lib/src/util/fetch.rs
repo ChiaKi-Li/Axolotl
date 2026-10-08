@@ -69,7 +69,7 @@ const SEGMENT_EXPANSION_INTERVAL: time::Duration =
     time::Duration::from_millis(1500);
 #[cfg(not(test))]
 const RANGE_IDLE_RECONNECT_TIMEOUT: time::Duration =
-    time::Duration::from_secs(8);
+    time::Duration::from_secs(30);
 #[cfg(test)]
 const RANGE_IDLE_RECONNECT_TIMEOUT: time::Duration =
     time::Duration::from_millis(250);
@@ -87,7 +87,7 @@ const FILE_TRANSFER_CONNECT_TIMEOUT: time::Duration =
 const RESOURCE_WAIT_TIMEOUT: time::Duration = time::Duration::from_secs(45);
 #[cfg(not(test))]
 const FILE_TRANSFER_READ_TIMEOUT: time::Duration =
-    time::Duration::from_secs(60);
+    time::Duration::from_secs(30);
 #[cfg(test)]
 const FILE_TRANSFER_READ_TIMEOUT: time::Duration = time::Duration::from_secs(2);
 #[cfg(not(test))]
@@ -256,6 +256,7 @@ pub struct DownloadRequest {
     pub download_meta: Option<DownloadMeta>,
     pub header: Option<(String, String)>,
     pub candidate_urls: Vec<String>,
+    pub(crate) preserve_candidate_order: bool,
     /// Whether range-segmented (multi-connection) downloading is allowed.
     /// Batch schedulers disable it so many small files share one connection
     /// budget instead of each file multiplying its connections.
@@ -286,6 +287,7 @@ impl DownloadRequest {
             download_meta: None,
             header: None,
             candidate_urls: Vec::new(),
+            preserve_candidate_order: false,
             allow_segmented_download: true,
             allow_http1_segmented_download: true,
             h2_range_concurrency: None,
@@ -338,6 +340,16 @@ impl DownloadRequest {
         S: Into<String>,
     {
         self.candidate_urls.extend(urls.into_iter().map(Into::into));
+        self
+    }
+
+    pub(crate) fn with_exact_candidate_urls<I, S>(mut self, urls: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.candidate_urls.extend(urls.into_iter().map(Into::into));
+        self.preserve_candidate_order = true;
         self
     }
 
@@ -5207,6 +5219,19 @@ fn build_download_routes(
     let mut urls = Vec::with_capacity(request.candidate_urls.len() + 1);
     urls.push(request.url.clone());
     urls.extend(request.candidate_urls.iter().cloned());
+    if request.preserve_candidate_order {
+        let mut seen = HashSet::new();
+        return urls
+            .into_iter()
+            .filter(|url| seen.insert(url.clone()))
+            .map(|url| {
+                super::download::provider_policy::exact_provider_route(
+                    url,
+                    request.resource,
+                )
+            })
+            .collect();
+    }
     let mut routes = Vec::new();
     for (index, url) in urls.into_iter().enumerate() {
         let mut candidates =

@@ -1614,7 +1614,13 @@ pub(crate) async fn install_zipped_mrpack_files_with_reporter(
                         ])
                         .await?;
                 }
-                let Some(primary_url) = project.downloads.first() else {
+                let download_urls = crate::util::download::provider_policy::modrinth_resource_urls(
+                    &project.downloads,
+                    Some(content_context.download_meta.game_version.as_str()),
+                    Some(content_context.download_meta.loader.as_str()),
+                    description.modrinth_api_latency,
+                );
+                let Some(primary_url) = download_urls.first() else {
                     return Err(crate::ErrorKind::InputError(format!(
                         "Modpack file {} has no download URL",
                         project.path
@@ -1628,16 +1634,7 @@ pub(crate) async fn install_zipped_mrpack_files_with_reporter(
                         .hashes
                         .get(&PackFileHash::Sha512)
                         .cloned(),
-                    content: if project
-                        .path
-                        .as_str()
-                        .to_ascii_lowercase()
-                        .ends_with(".jar")
-                    {
-                        ContentValidation::Jar
-                    } else {
-                        ContentValidation::None
-                    },
+                    content: ContentValidation::None,
                     ..Integrity::default()
                 };
                 // Only the transfer owns a network worker. Metadata and DB
@@ -1656,8 +1653,8 @@ pub(crate) async fn install_zipped_mrpack_files_with_reporter(
                 seed_mrpack_staged_download(&target_path, &download_path).await;
                 let download = match download_to_path(
                     DownloadRequest::new(primary_url, ResourceClass::Modpack)
-                        .with_candidate_urls(
-                            project.downloads.iter().skip(1).cloned(),
+                        .with_exact_candidate_urls(
+                            download_urls.iter().skip(1).cloned(),
                         )
                         .with_integrity(integrity)
                         .with_download_meta(

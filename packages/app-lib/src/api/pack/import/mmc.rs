@@ -224,6 +224,7 @@ pub(crate) async fn import_mmc_instance_dir(
         version_id: None,
         instance_id: instance_id.to_string(),
         source_filename: None,
+        modrinth_api_latency: None,
     };
 
     let mut minecraft_folder = mmc_instance_path.join("minecraft");

@@ -20,9 +20,9 @@ use crate::state::{
     Settings,
 };
 use crate::util::fetch::{
-    ContentValidation, DownloadRequest, DownloadRouteSource, FetchProgressFn,
-    Integrity, ProxyPolicy, ResourceClass, download_to_path,
-    resolve_download_routes_for, sha1_file_async, sha1_file_cancellable,
+    DownloadRequest, DownloadRouteSource, FetchProgressFn, Integrity,
+    ProxyPolicy, ResourceClass, download_to_path, resolve_download_routes_for,
+    sha1_file_async, sha1_file_cancellable,
 };
 use crate::{ErrorKind, State};
 use dashmap::DashMap;
@@ -580,7 +580,6 @@ pub(crate) async fn stage_curseforge_upgrade_file(
         &url,
         &file,
         &path,
-        curseforge_content_validation(&file.file_name),
         None,
         reporter.map(|reporter| (reporter, tracking.as_str())),
         None,
@@ -1576,7 +1575,6 @@ pub async fn install_world_with_reporter(
         &download_url,
         &file,
         &staging_path,
-        curseforge_content_validation(&file.file_name),
         None,
         Some((&reporter, &tracking_path)),
         None,
@@ -8714,22 +8712,7 @@ fn validate_cdn_url(url: &reqwest::Url) -> crate::Result<()> {
     Ok(())
 }
 
-fn curseforge_content_validation(file_name: &str) -> ContentValidation {
-    match Path::new(file_name)
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .map(str::to_ascii_lowercase)
-        .as_deref()
-    {
-        Some("jar" | "zip" | "mrpack") => ContentValidation::Jar,
-        _ => ContentValidation::None,
-    }
-}
-
-fn curseforge_integrity(
-    file: &CurseForgeFile,
-    validation: ContentValidation,
-) -> Integrity {
+fn curseforge_integrity(file: &CurseForgeFile) -> Integrity {
     Integrity {
         size: Some(file.file_length),
         sha1: file
@@ -8737,12 +8720,6 @@ fn curseforge_integrity(
             .iter()
             .find(|hash| hash.algo == 1)
             .map(|hash| hash.value.clone()),
-        md5: file
-            .hashes
-            .iter()
-            .find(|hash| hash.algo == 2)
-            .map(|hash| hash.value.clone()),
-        content: validation,
         ..Integrity::default()
     }
 }
@@ -8762,46 +8739,26 @@ fn curseforge_candidate_urls(url: &str) -> crate::Result<Vec<String>> {
         )
     })?;
     validate_cdn_url(&parsed)?;
-    if !is_forge_cdn_url(&parsed) {
-        return Ok(Vec::new());
-    }
-
-    let original_host = parsed.host_str().unwrap_or_default();
-    let mut candidates = Vec::new();
-    for host in [
-        "edge.forgecdn.net",
-        "media.forgecdn.net",
-        "mediafilez.forgecdn.net",
-    ] {
-        if host == original_host {
-            continue;
-        }
-        let mut candidate = parsed.clone();
-        candidate.set_host(Some(host)).map_err(|_| {
-            ErrorKind::InputError(
-                "CurseForge returned an invalid CDN URL".to_string(),
-            )
-        })?;
-        candidates.push(candidate.to_string());
-    }
-    Ok(candidates)
+    Ok(crate::util::download::provider_policy::curseforge_download_urls(url))
 }
 
 async fn download_curseforge_path(
     url: &str,
     file: &CurseForgeFile,
     destination: &Path,
-    validation: ContentValidation,
     progress: Option<&mut FetchProgressFn<'_>>,
     tracking: Option<(&InstallProgressReporter, &str)>,
     h2_range_concurrency: Option<usize>,
     allow_http1_segmented_download: bool,
 ) -> crate::Result<crate::util::fetch::DownloadResult> {
     let state = State::get().await?;
-    let mut request = DownloadRequest::new(url, ResourceClass::CurseForge)
-        .with_candidate_urls(curseforge_candidate_urls(url)?)
-        .with_integrity(curseforge_integrity(file, validation))
-        .with_http1_segmented_download(allow_http1_segmented_download);
+    let urls = curseforge_candidate_urls(url)?;
+    let primary_url = urls.first().map(String::as_str).unwrap_or(url);
+    let mut request =
+        DownloadRequest::new(primary_url, ResourceClass::CurseForge)
+            .with_exact_candidate_urls(urls.iter().skip(1).cloned())
+            .with_integrity(curseforge_integrity(file))
+            .with_http1_segmented_download(allow_http1_segmented_download);
     if let Some(concurrency) = h2_range_concurrency {
         request = request.with_h2_range_concurrency(concurrency);
     }
@@ -8851,7 +8808,6 @@ async fn download_curseforge_archive(
         url,
         file,
         &path,
-        ContentValidation::Jar,
         progress,
         reporter.map(|reporter| (reporter, tracking_item_id.as_str())),
         curseforge_modpack_h2_range_concurrency(file.file_length),
@@ -9425,7 +9381,6 @@ async fn download_installed_file(
         url,
         file,
         download_path,
-        curseforge_content_validation(&file.file_name),
         None,
         download_metrics
             .and_then(|metrics| metrics.reporter.as_ref())

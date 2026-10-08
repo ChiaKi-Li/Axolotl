@@ -409,7 +409,11 @@ pub(crate) fn request_headers(
     if let Some((name, value)) = &request.header
         && (route.allow_sensitive_headers || !fetch::is_sensitive_header(name))
         && (!name.eq_ignore_ascii_case("x-api-key")
-            || route_host.as_deref() == Some("api.curseforge.com"))
+            || route_host.as_deref() == Some("api.curseforge.com")
+            || (route.allow_sensitive_headers
+                && route_host.as_deref().is_some_and(|host| {
+                    host == "forgecdn.net" || host.ends_with(".forgecdn.net")
+                })))
         && let Ok(name) = http::header::HeaderName::from_str(name)
         && let Ok(value) = HeaderValue::from_str(value)
     {

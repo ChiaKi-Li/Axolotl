@@ -169,6 +169,7 @@ async fn register_instance(
         version_id: None,
         instance_id: instance_id.to_string(),
         source_filename: None,
+        modrinth_api_latency: None,
     };
     let dependencies = build_dependencies(info).await?;
 

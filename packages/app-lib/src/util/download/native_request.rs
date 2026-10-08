@@ -72,7 +72,12 @@ pub(crate) async fn send_path_request_with_clients(
         if let Some((name, value)) = custom_header
             && (allow_sensitive || !is_sensitive_header(name))
             && (!name.eq_ignore_ascii_case("x-api-key")
-                || original.host_str() == Some("api.curseforge.com"))
+                || original.host_str() == Some("api.curseforge.com")
+                || (route.allow_sensitive_headers
+                    && original.host_str().is_some_and(|host| {
+                        host == "forgecdn.net"
+                            || host.ends_with(".forgecdn.net")
+                    })))
         {
             request = request.header(name, value);
         }

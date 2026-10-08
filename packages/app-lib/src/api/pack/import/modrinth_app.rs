@@ -196,6 +196,7 @@ pub async fn import_instance(
         version_id: None,
         instance_id: instance_id.to_string(),
         source_filename: None,
+        modrinth_api_latency: None,
     };
     install_from::set_instance_information(
         instance_id.to_string(),

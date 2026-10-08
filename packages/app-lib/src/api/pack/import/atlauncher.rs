@@ -165,6 +165,7 @@ pub async fn import_atlauncher_dir(
         version_id: None,
         instance_id: instance_id.to_string(),
         source_filename: None,
+        modrinth_api_latency: None,
     };
 
     let backup_name = format!(
