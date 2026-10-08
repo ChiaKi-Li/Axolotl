@@ -669,7 +669,7 @@ fn main() {
                 InlinedPlugin::new()
                     .commands(&[
                         "settings_get",
-                        "settings_set",
+                        "settings_patch",
                         "privacy_get",
                         "privacy_set",
                         "telemetry_set",
