@@ -10398,7 +10398,7 @@ mod tests {
             )
             .await;
         let verified = verified.unwrap();
-        assert_eq!(scans, if cfg!(unix) { 0 } else { 1 });
+        assert_eq!(scans, usize::from(!cfg!(unix)));
         assert_eq!(verified.sha1, sha1);
         assert_eq!(
             verified.pending_completion,
