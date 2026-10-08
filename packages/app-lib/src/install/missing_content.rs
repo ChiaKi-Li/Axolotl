@@ -734,6 +734,7 @@ pub async fn retry_missing_modpack_file(
     let result = download_to_path(
         DownloadRequest::new(primary_url, ResourceClass::Modpack)
             .with_provider_script_policy()
+            .with_provider_browser_headers()
             .with_exact_candidate_urls(
                 file.download_urls.iter().skip(1).cloned(),
             )

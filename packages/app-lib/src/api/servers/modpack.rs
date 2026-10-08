@@ -81,6 +81,8 @@ impl AggregateProgress {
 struct MrpackIndex {
     #[serde(default)]
     files: Vec<MrpackFile>,
+    #[serde(default)]
+    dependencies: HashMap<String, String>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -273,7 +275,12 @@ async fn run_modpack_install(
         mrpack_url,
         &dir.join(MRPACK_FILENAME),
         mrpack_sha1.map(str::to_string),
+        None,
+        None,
         ResourceClass::Modpack,
+        None,
+        None,
+        false,
         AggregateProgress::new(0),
     )
     .await?;
@@ -310,24 +317,41 @@ async fn run_modpack_install(
     )
     .await?;
 
-    let files: Vec<(String, String, Option<String>, u64)> = installable_files
-        .iter()
-        .filter_map(|file| {
-            file.downloads.first().map(|url| {
-                (
-                    file.path.clone(),
-                    url.clone(),
-                    file.hashes.get("sha1").cloned(),
-                    file.file_size.unwrap_or(0),
-                )
+    let files: Vec<(String, String, Option<String>, Option<String>, u64)> =
+        installable_files
+            .iter()
+            .filter_map(|file| {
+                file.downloads.first().map(|url| {
+                    (
+                        file.path.clone(),
+                        url.clone(),
+                        file.hashes.get("sha1").cloned(),
+                        file.hashes.get("sha512").cloned(),
+                        file.file_size.unwrap_or(0),
+                    )
+                })
             })
-        })
-        .collect();
+            .collect();
+
+    let game_version = index.dependencies.get("minecraft").cloned();
+    let loader = index
+        .dependencies
+        .keys()
+        .find(|key| key.to_ascii_lowercase() != "minecraft")
+        .map(|key| match key.to_ascii_lowercase().as_str() {
+            "forge" => "forge".to_string(),
+            "neoforge" | "neo-forge" => "neoforge".to_string(),
+            "fabric-loader" => "fabric".to_string(),
+            "quilt-loader" => "quilt".to_string(),
+            other => other.to_string(),
+        });
 
     let progress = AggregateProgress::new(total_bytes);
     let state_ref = state.clone();
     let dir_ref = dir.to_path_buf();
     let server_id_ref = server_id.to_string();
+    let game_version_ref = game_version.clone();
+    let loader_ref = loader.clone();
     let num_files = files.len();
     loading_try_for_each_concurrent(
         stream::iter(files).map(Ok::<_, crate::Error>),
@@ -336,11 +360,13 @@ async fn run_modpack_install(
         0.0,
         num_files,
         None,
-        move |(path, url, sha1, size)| {
+        move |(path, url, sha1, sha512, size)| {
             let server_id = server_id_ref.clone();
             let dir = dir_ref.clone();
             let state = state_ref.clone();
             let progress = progress.clone();
+            let game_version = game_version_ref.clone();
+            let loader = loader_ref.clone();
             async move {
                 log(&server_id, &format!("Downloading {path}")).await?;
                 let destination = dir.join(&path);
@@ -353,7 +379,12 @@ async fn run_modpack_install(
                     &url,
                     &destination,
                     sha1,
-                    ResourceClass::Modpack,
+                    sha512,
+                    Some(size),
+                    ResourceClass::Modrinth,
+                    game_version.as_deref(),
+                    loader.as_deref(),
+                    true,
                     progress.clone(),
                 )
                 .await?;
@@ -477,32 +508,55 @@ async fn download_with_engine(
     url: &str,
     destination: &Path,
     sha1: Option<String>,
+    sha512: Option<String>,
+    expected_size: Option<u64>,
     resource: ResourceClass,
+    game_version: Option<&str>,
+    loader: Option<&str>,
+    browser_headers: bool,
     progress: AggregateProgress,
 ) -> Result<()> {
-    let provider_urls = if resource == ResourceClass::Modpack {
-        if url.to_ascii_lowercase().contains("forgecdn.net") {
+    let provider_urls = match resource {
+        ResourceClass::Modrinth => {
+            crate::util::download::provider_policy::modrinth_resource_urls(
+                std::slice::from_ref(&url.to_string()),
+                game_version,
+                loader,
+                None,
+            )
+        }
+        ResourceClass::Modpack
+            if url.to_ascii_lowercase().contains("forgecdn.net") =>
+        {
             crate::util::download::provider_policy::curseforge_download_urls(
                 url,
             )
-        } else {
+        }
+        ResourceClass::Modpack => {
             crate::util::download::provider_policy::modrinth_pack_urls(
                 std::slice::from_ref(&url.to_string()),
                 None,
             )
         }
-    } else {
-        vec![url.to_string()]
+        _ => vec![url.to_string()],
     };
     let primary_url = provider_urls.first().map(String::as_str).unwrap_or(url);
     let mut request = DownloadRequest::new(primary_url, resource);
-    if resource == ResourceClass::Modpack {
+    if matches!(resource, ResourceClass::Modrinth | ResourceClass::Modpack) {
         request = request
             .with_provider_script_policy()
             .with_exact_candidate_urls(provider_urls.iter().skip(1).cloned());
+        if browser_headers {
+            request = request.with_provider_browser_headers();
+        }
     }
-    if let Some(sha1) = &sha1 {
-        request = request.with_integrity(Integrity::sha1(sha1.clone()));
+    if expected_size.is_some() || sha1.is_some() || sha512.is_some() {
+        request = request.with_integrity(Integrity {
+            size: expected_size,
+            sha1,
+            sha512,
+            ..Integrity::default()
+        });
     }
     request = request.with_segmented_download(true);
 
@@ -599,7 +653,13 @@ async fn fetch_excluded_mod_ids(
     state: &State,
     excluded_files: &[&MrpackFile],
 ) -> Result<HashSet<String>> {
-    let candidates: Vec<(String, String, Option<String>)> = excluded_files
+    let candidates: Vec<(
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<u64>,
+    )> = excluded_files
         .iter()
         .filter_map(|file| {
             let path = file.path.replace('\\', "/");
@@ -613,6 +673,8 @@ async fn fetch_excluded_mod_ids(
                     path.rsplit('/').next().unwrap_or(&path).to_string(),
                     url.clone(),
                     file.hashes.get("sha1").cloned(),
+                    file.hashes.get("sha512").cloned(),
+                    file.file_size,
                 )
             })
         })
@@ -631,9 +693,18 @@ async fn fetch_excluded_mod_ids(
         ErrorKind::FSError(format!("Failed to create temporary directory: {e}"))
     })?;
     let mut unavailable = HashSet::new();
-    for (filename, url, sha1) in candidates {
+    for (filename, url, sha1, sha512, expected_size) in candidates {
         let destination = temp_dir.path().join(&filename);
-        match download_metadata_jar(state, &url, &destination, sha1).await {
+        match download_metadata_jar(
+            state,
+            &url,
+            &destination,
+            sha1,
+            sha512,
+            expected_size,
+        )
+        .await
+        {
             Ok(()) => match read_mod_metadata(&destination) {
                 Some(metadata) => {
                     unavailable
@@ -668,6 +739,8 @@ async fn download_metadata_jar(
     url: &str,
     destination: &Path,
     sha1: Option<String>,
+    sha512: Option<String>,
+    expected_size: Option<u64>,
 ) -> Result<()> {
     let download_urls =
         crate::util::download::provider_policy::modrinth_resource_urls(
@@ -681,8 +754,13 @@ async fn download_metadata_jar(
         .with_provider_script_policy()
         .with_provider_browser_headers()
         .with_exact_candidate_urls(download_urls.iter().skip(1).cloned());
-    if let Some(sha1) = &sha1 {
-        request = request.with_integrity(Integrity::sha1(sha1.clone()));
+    if expected_size.is_some() || sha1.is_some() || sha512.is_some() {
+        request = request.with_integrity(Integrity {
+            size: expected_size,
+            sha1,
+            sha512,
+            ..Integrity::default()
+        });
     }
     download_to_path(
         request,

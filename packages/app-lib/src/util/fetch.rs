@@ -3239,6 +3239,10 @@ impl DownloadRange {
         self.state.lock().active
     }
 
+    fn has_received_data(&self) -> bool {
+        self.state.lock().downloaded > 0
+    }
+
     fn split_tail(&self, index: usize) -> Option<Self> {
         let mut state = self.state.lock();
         let remaining = state
@@ -3321,6 +3325,8 @@ struct ProviderSourceState {
     sources: HashMap<String, ProviderSourceStats>,
     received_bytes: u64,
     connect_samples: Vec<time::Duration>,
+    failures_in_row: u32,
+    failure_budget_exhausted: bool,
 }
 
 #[derive(Default)]
@@ -3369,6 +3375,7 @@ impl ProviderSourceState {
 
     fn record_data(&mut self, route: &DownloadRoute, bytes: u64) {
         self.received_bytes = self.received_bytes.saturating_add(bytes);
+        self.failures_in_row = 0;
         if let Some(source) = self.sources.get_mut(&route.url) {
             source.failures = 0;
         }
@@ -3384,6 +3391,14 @@ impl ProviderSourceState {
     ) -> bool {
         let source = self.sources.entry(route.url.clone()).or_default();
         source.failures = source.failures.saturating_add(1);
+        self.failures_in_row = self.failures_in_row.saturating_add(1);
+        let failure_limit = thread_limit
+            .saturating_mul(8)
+            .saturating_add(3)
+            .clamp(8, 10_000) as u32;
+        if self.failures_in_row >= failure_limit {
+            self.failure_budget_exhausted = true;
+        }
         let detail = message.unwrap_or_default().to_ascii_lowercase();
         let url = route.url.to_ascii_lowercase();
         let fatal = protocol_fatal
@@ -3403,6 +3418,10 @@ impl ProviderSourceState {
             source.disabled = true;
         }
         fatal
+    }
+
+    fn failure_budget_exhausted(&self) -> bool {
+        self.failure_budget_exhausted
     }
 }
 
@@ -5302,6 +5321,7 @@ async fn try_segmented_download(
     let hedge_active = AtomicBool::new(false);
     let mut downloads = futures::stream::FuturesUnordered::new();
     let mut ranges = create_initial_ranges(size, permits.len());
+    let mut provider_pause_until = Instant::now();
     for (range, permit) in ranges.iter().cloned().zip(permits) {
         downloads.push(download_segment(
             route,
@@ -5330,6 +5350,12 @@ async fn try_segmented_download(
             provider_sources.clone(),
             cancellation,
         ));
+    }
+    if request.provider_script_policy
+        && route.url.to_ascii_lowercase().contains("bmclapi")
+    {
+        provider_pause_until =
+            Instant::now() + time::Duration::from_millis(100);
     }
     tracing::debug!(
         original_url = %sanitize_url_for_log(&route.url),
@@ -5430,15 +5456,26 @@ async fn try_segmented_download(
             }
             _ = scheduler.tick() => {
                 if request.provider_script_policy {
+                    if Instant::now() < provider_pause_until {
+                        continue;
+                    }
                     let snapshot = speed.provider_speed_snapshot();
                     if snapshot.aggregate_speed >= snapshot.speed_floor {
                         continue;
                     }
-                    if downloaded == 0 {
-                        continue;
-                    }
                     let active_ranges = downloads.len();
                     if active_ranges >= concurrency_cap {
+                        continue;
+                    }
+                    let preparing = ranges
+                        .iter()
+                        .filter(|range| range.is_active() && !range.has_received_data())
+                        .count();
+                    let downloading = ranges
+                        .iter()
+                        .filter(|range| range.is_active() && range.has_received_data())
+                        .count();
+                    if preparing > downloading {
                         continue;
                     }
                     let range = ranges
@@ -5481,6 +5518,10 @@ async fn try_segmented_download(
                             cancellation,
                         ));
                         ranges.push(new_range);
+                        if route.url.to_ascii_lowercase().contains("bmclapi") {
+                            provider_pause_until =
+                                Instant::now() + time::Duration::from_millis(100);
+                        }
                     }
                     continue;
                 }
@@ -6675,6 +6716,10 @@ impl NativeDownloadSession {
         )
     }
 
+    fn provider_failure_budget_exhausted(&self) -> bool {
+        self.provider_sources.lock().failure_budget_exhausted()
+    }
+
     fn take_final_error(&mut self, request: &DownloadRequest) -> crate::Error {
         self.last_error.take().unwrap_or_else(|| {
             ErrorKind::OtherError(format!(
@@ -6816,6 +6861,11 @@ async fn run_native_download_attempts(
             )
             .await?;
             if request.provider_script_policy
+                && session.provider_failure_budget_exhausted()
+            {
+                break;
+            }
+            if request.provider_script_policy
                 && session.attempts > attempts_before_route
                 && matches!(route_attempt, NativeRouteAttempt::Continue)
             {
@@ -6839,6 +6889,23 @@ async fn run_native_download_attempts(
                 NativeRouteAttempt::Completed(result) => return Ok(result),
                 NativeRouteAttempt::Continue => {}
             }
+        }
+        if request.provider_script_policy
+            && session.provider_failure_budget_exhausted()
+        {
+            break;
+        }
+        if request.provider_script_policy && !retry_with_single_thread {
+            let normal_source_available = routes.iter().any(|route| {
+                !session.terminal_routes.contains(&route.url)
+                    && !session.provider_source_is_disabled(route)
+            });
+            if !normal_source_available {
+                session.provider_fallback_pending = true;
+            }
+        }
+        if request.provider_script_policy && retry_with_single_thread {
+            break;
         }
         if round + 1 < round_count
             && !session.provider_fallback_pending
