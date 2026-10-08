@@ -1042,12 +1042,16 @@ static ROUTE_PROBE_SEMAPHORE: LazyLock<FetchSemaphore> =
 struct ProviderBatchState {
     active: AtomicUsize,
     speed: DownloadSpeedTracker,
+    connect_samples: Mutex<Vec<time::Duration>>,
+    next_bmclapi_launch: Mutex<Instant>,
 }
 
 static PROVIDER_BATCH_STATE: LazyLock<ProviderBatchState> =
     LazyLock::new(|| ProviderBatchState {
         active: AtomicUsize::new(0),
         speed: DownloadSpeedTracker::default(),
+        connect_samples: Mutex::new(Vec::new()),
+        next_bmclapi_launch: Mutex::new(Instant::now()),
     });
 
 struct ProviderBatchGuard;
@@ -1056,6 +1060,8 @@ impl ProviderBatchGuard {
     fn acquire() -> Self {
         if PROVIDER_BATCH_STATE.active.fetch_add(1, Ordering::AcqRel) == 0 {
             PROVIDER_BATCH_STATE.speed.reset();
+            PROVIDER_BATCH_STATE.connect_samples.lock().clear();
+            *PROVIDER_BATCH_STATE.next_bmclapi_launch.lock() = Instant::now();
         }
         Self
     }
@@ -1069,6 +1075,62 @@ impl Drop for ProviderBatchGuard {
 
 fn provider_batch_speed() -> &'static DownloadSpeedTracker {
     &PROVIDER_BATCH_STATE.speed
+}
+
+fn provider_batch_record_connect_sample(sample: time::Duration) {
+    if PROVIDER_BATCH_STATE.active.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let mut samples = PROVIDER_BATCH_STATE.connect_samples.lock();
+    samples.push(sample);
+    if samples.len() > 256 {
+        samples.remove(0);
+    }
+}
+
+fn provider_batch_average_connect() -> Option<time::Duration> {
+    if PROVIDER_BATCH_STATE.active.load(Ordering::Acquire) == 0 {
+        return None;
+    }
+    let samples = PROVIDER_BATCH_STATE.connect_samples.lock();
+    if samples.is_empty() {
+        return None;
+    }
+    let total_ms = samples
+        .iter()
+        .map(|sample| sample.as_millis())
+        .sum::<u128>();
+    Some(time::Duration::from_millis(
+        (total_ms / samples.len() as u128).min(u128::from(u64::MAX)) as u64,
+    ))
+}
+
+async fn wait_provider_launch(
+    route: &DownloadRoute,
+    cancellation: Option<&tokio_util::sync::CancellationToken>,
+) -> bool {
+    if !route.url.to_ascii_lowercase().contains("bmclapi") {
+        return true;
+    }
+    let wait = {
+        let mut next = PROVIDER_BATCH_STATE.next_bmclapi_launch.lock();
+        let now = Instant::now();
+        let wait = (*next).saturating_duration_since(now);
+        *next = now + wait + time::Duration::from_millis(100);
+        wait
+    };
+    if wait.is_zero() {
+        return true;
+    }
+    if let Some(cancellation) = cancellation {
+        tokio::select! {
+            _ = cancellation.cancelled() => false,
+            _ = tokio::time::sleep(wait) => true,
+        }
+    } else {
+        tokio::time::sleep(wait).await;
+        true
+    }
 }
 
 pub(crate) async fn acquire_native_validation_permit()
@@ -3383,22 +3445,25 @@ impl ProviderSourceState {
 
     fn record_connect_sample(&mut self, sample: time::Duration) {
         self.connect_samples.push(sample);
+        provider_batch_record_connect_sample(sample);
     }
 
     fn timeout_for(&self, route: &DownloadRoute) -> time::Duration {
-        let average = if self.connect_samples.is_empty() {
-            None
-        } else {
-            let total_ms = self
-                .connect_samples
-                .iter()
-                .map(|sample| sample.as_millis())
-                .sum::<u128>();
-            Some(time::Duration::from_millis(
-                (total_ms / self.connect_samples.len() as u128)
-                    .min(u128::from(u64::MAX)) as u64,
-            ))
-        };
+        let average = provider_batch_average_connect().or_else(|| {
+            if self.connect_samples.is_empty() {
+                None
+            } else {
+                let total_ms = self
+                    .connect_samples
+                    .iter()
+                    .map(|sample| sample.as_millis())
+                    .sum::<u128>();
+                Some(time::Duration::from_millis(
+                    (total_ms / self.connect_samples.len() as u128)
+                        .min(u128::from(u64::MAX)) as u64,
+                ))
+            }
+        });
         crate::util::download::native_slow::provider_timeout(
             average,
             self.failure_count(route),
@@ -5024,6 +5089,9 @@ async fn download_segment(
             .is_some_and(|sources| sources.lock().is_disabled(candidate))
         {
             continue;
+        }
+        if !wait_provider_launch(candidate, cancellation).await {
+            return Err(SegmentDownloadError::Transport);
         }
         let current_permit = match permit.take() {
             Some(permit) => permit,
@@ -7247,6 +7315,13 @@ async fn run_native_route_attempts(
             DownloadItemStatus::WaitingForResource,
         )
         .await;
+        if request.provider_script_policy
+            && !wait_provider_launch(route, request.cancellation.as_ref()).await
+        {
+            return Err(
+                ErrorKind::OtherError("download canceled".to_string()).into()
+            );
+        }
         let permit_wait = tokio::time::timeout(
             RESOURCE_WAIT_TIMEOUT,
             acquire_native_connection(route, semaphore),
