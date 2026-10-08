@@ -3560,6 +3560,21 @@
   "app.instances.batch-edit-groups.save-changes": {
     "message": "保存"
   },
+  "app.instances.batch-edit-groups.loading": {
+    "message": "正在加载实例…"
+  },
+  "app.instances.batch-edit-groups.load-failed": {
+    "message": "无法加载实例，请重试。"
+  },
+  "app.instances.batch-edit-groups.retry": {
+    "message": "重试"
+  },
+  "app.instances.batch-edit-groups.save-failed": {
+    "message": "无法保存分组。已保留你的修改，请重试。"
+  },
+  "app.instances.batch-edit-groups.membership-failed": {
+    "message": "分组已创建，但实例关系未能保存。请重试以完成保存。"
+  },
   "app.library.group.new": {
     "message": "新建分组"
   },
