@@ -3,6 +3,11 @@ import { expect, it, vi } from 'vitest'
 
 import LabRecipeGenerator from './LabRecipeGenerator.vue'
 
+const resourceLoads = vi.hoisted(() => ({
+    deferred: false,
+    pending: [] as { version: string; resolve: (value: unknown) => void }[],
+}))
+
 vi.mock('@/components/lab/recipe-generator/InstanceExportModal.vue', () => ({
     default: { render: () => null },
 }))
@@ -24,12 +29,11 @@ vi.mock('@/components/lab/recipe-generator/TagPalette.vue', () => ({
 
 vi.mock('@/lab/recipe-generator/resources', async (importOriginal) => ({
     ...(await importOriginal<typeof import('@/lab/recipe-generator/resources')>()),
-    loadVersionResources: async (version: string) => ({
-        version,
-        items: [],
-        itemsById: {},
-        vanillaTags: {},
-    }),
+    loadVersionResources: (version: string) => {
+        const result = { version, items: [], itemsById: {}, vanillaTags: {} }
+        if (!resourceLoads.deferred) return Promise.resolve(result)
+        return new Promise((resolve) => resourceLoads.pending.push({ version, resolve }))
+    },
 }))
 vi.mock('@modrinth/ui', async () => {
     const { defineComponent, h, ref } = await import('vue')
@@ -103,6 +107,41 @@ it('row clone and delete operate on that row while another recipe is selected', 
         expect(rows()).toHaveLength(1)
         expect((group().element as HTMLInputElement).value).toBe('')
     } finally {
+        wrapper.unmount()
+    }
+})
+
+it('keeps resources and loading state owned by the latest selected version', async () => {
+    resourceLoads.deferred = true
+    resourceLoads.pending = []
+    const wrapper = mount(LabRecipeGenerator, { global: { directives: { tooltip: () => {} } } })
+    try {
+        await flushPromises()
+        expect(resourceLoads.pending.map(({ version }) => version)).toEqual(['26.2'])
+        ;(wrapper.vm as { store: { selectedVersion: string } }).store.selectedVersion = '1.20'
+        await flushPromises()
+        expect(resourceLoads.pending.map(({ version }) => version)).toEqual(['26.2', '1.20'])
+        const oldResult = {
+            version: '26.2',
+            items: [{ id: 'old' }],
+            itemsById: {},
+            vanillaTags: {},
+        }
+        resourceLoads.pending[0].resolve(oldResult)
+        await flushPromises()
+        expect(wrapper.text()).toContain('Loading version data')
+        const currentResult = {
+            version: '1.20',
+            items: [{ id: 'current' }],
+            itemsById: {},
+            vanillaTags: {},
+        }
+        resourceLoads.pending[1].resolve(currentResult)
+        await flushPromises()
+        expect(wrapper.text()).not.toContain('Loading version data')
+        expect((wrapper.vm as { resources: { version: string } }).resources.version).toBe('1.20')
+    } finally {
+        resourceLoads.deferred = false
         wrapper.unmount()
     }
 })

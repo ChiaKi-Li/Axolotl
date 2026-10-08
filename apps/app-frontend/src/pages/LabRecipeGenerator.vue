@@ -28,6 +28,7 @@ import RecipeItemIcon from '@/components/lab/recipe-generator/RecipeItemIcon.vue
 import RecipeSlotGrid from '@/components/lab/recipe-generator/RecipeSlotGrid.vue'
 import TagPalette from '@/components/lab/recipe-generator/TagPalette.vue'
 import { useResultCountWheel } from '@/composables/lab/useResultCountWheel'
+import { createRequestGeneration } from '@/helpers/request-generation'
 import { drawCountOnCanvas } from '@/lab/recipe-generator/count-display'
 import {
     createDatapackDescription,
@@ -136,6 +137,7 @@ const store = reactive(createDefaultRecipeGeneratorStore())
 const resources = shallowRef<LoadedVersionResources | null>(null)
 const loadingResources = ref(false)
 const resourceError = ref('')
+const resourceRequests = createRequestGeneration()
 const rightTab = ref<'items' | 'tags'>('items')
 const pendingDatapack = ref<{ files: PackFile[]; fileName: string } | null>(null)
 const customItemDraft = reactive({ uid: '', id: '', name: '', texture: '' })
@@ -704,15 +706,28 @@ watch(
 )
 
 async function loadResources(version: JavaVersionId) {
+    const request = resourceRequests.begin(version)
     loadingResources.value = true
     resourceError.value = ''
     try {
-        resources.value = await loadVersionResources(version)
+        const result = await loadVersionResources(version)
+        if (
+            !resourceRequests.isCurrent(request, store.selectedVersion) ||
+            version !== store.selectedVersion
+        )
+            return
+        resources.value = result
     } catch (error) {
+        if (
+            !resourceRequests.isCurrent(request, store.selectedVersion) ||
+            version !== store.selectedVersion
+        )
+            return
         resources.value = null
         resourceError.value = error instanceof Error ? error.message : String(error)
     } finally {
-        loadingResources.value = false
+        if (resourceRequests.isCurrent(request, store.selectedVersion))
+            loadingResources.value = false
     }
 }
 

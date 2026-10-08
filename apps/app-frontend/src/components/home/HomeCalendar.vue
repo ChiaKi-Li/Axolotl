@@ -27,6 +27,7 @@ import {
     kill,
     run,
 } from '@/helpers/instance'
+import { createRequestGeneration } from '@/helpers/request-generation'
 import type { GameInstance } from '@/helpers/types'
 import { handleSevereError } from '@/store/error'
 
@@ -88,6 +89,8 @@ const activeTooltip = ref<{
     left: number
     top: number
 } | null>(null)
+const playtimeRequests = createRequestGeneration()
+const detailsRequests = createRequestGeneration()
 
 const periodStart = computed(() => startOfPeriod(anchor.value, 'month'))
 const periodEnd = computed(() => endOfPeriod(anchor.value, 'month'))
@@ -165,22 +168,47 @@ function showTooltip(event: PointerEvent | FocusEvent) {
 }
 
 async function refreshPlaytime() {
-    dailyPlaytime.value = await get_daily_playtime(
-        toDateKey(periodStart.value),
-        toDateKey(periodEnd.value),
-    ).catch((error): DailyPlaytime[] => {
-        handleError(error)
-        return []
-    })
+    const start = toDateKey(periodStart.value)
+    const end = toDateKey(periodEnd.value)
+    const request = playtimeRequests.begin(`${start}\0${end}`)
+    try {
+        const result = await get_daily_playtime(start, end)
+        if (
+            playtimeRequests.isCurrent(
+                request,
+                `${toDateKey(periodStart.value)}\0${toDateKey(periodEnd.value)}`,
+            ) &&
+            start === toDateKey(periodStart.value) &&
+            end === toDateKey(periodEnd.value)
+        ) {
+            dailyPlaytime.value = result
+        }
+    } catch (error) {
+        if (
+            playtimeRequests.isCurrent(
+                request,
+                `${toDateKey(periodStart.value)}\0${toDateKey(periodEnd.value)}`,
+            )
+        ) {
+            handleError(error)
+            dailyPlaytime.value = []
+        }
+    }
 }
 
 async function refreshDayDetails() {
-    dayDetails.value = await get_daily_playtime_details(selectedKey.value).catch(
-        (error): DailyPlaytimeEntry[] => {
+    const dateKey = selectedKey.value
+    const request = detailsRequests.begin(dateKey)
+    try {
+        const result = await get_daily_playtime_details(dateKey)
+        if (detailsRequests.isCurrent(request, selectedKey.value) && dateKey === selectedKey.value)
+            dayDetails.value = result
+    } catch (error) {
+        if (detailsRequests.isCurrent(request, selectedKey.value)) {
             handleError(error)
-            return []
-        },
-    )
+            dayDetails.value = []
+        }
+    }
 }
 
 function movePeriod(amount: number) {
