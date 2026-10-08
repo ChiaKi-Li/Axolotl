@@ -50,6 +50,11 @@ impl Default for DownloadSpeedTracker {
 }
 
 impl DownloadSpeedTracker {
+    pub fn reset(&self) {
+        self.completed_bytes.store(0, Ordering::Relaxed);
+        *self.speed.lock() = SpeedState::default();
+    }
+
     pub fn record_bytes(&self, bytes: u64) {
         self.completed_bytes.fetch_add(bytes, Ordering::Relaxed);
     }

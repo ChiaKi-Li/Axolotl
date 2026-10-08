@@ -1039,6 +1039,38 @@ static FILE_VALIDATION_SEMAPHORE: LazyLock<Semaphore> =
 static ROUTE_PROBE_SEMAPHORE: LazyLock<FetchSemaphore> =
     LazyLock::new(|| FetchSemaphore(Semaphore::new(2)));
 
+struct ProviderBatchState {
+    active: AtomicUsize,
+    speed: DownloadSpeedTracker,
+}
+
+static PROVIDER_BATCH_STATE: LazyLock<ProviderBatchState> =
+    LazyLock::new(|| ProviderBatchState {
+        active: AtomicUsize::new(0),
+        speed: DownloadSpeedTracker::default(),
+    });
+
+struct ProviderBatchGuard;
+
+impl ProviderBatchGuard {
+    fn acquire() -> Self {
+        if PROVIDER_BATCH_STATE.active.fetch_add(1, Ordering::AcqRel) == 0 {
+            PROVIDER_BATCH_STATE.speed.reset();
+        }
+        Self
+    }
+}
+
+impl Drop for ProviderBatchGuard {
+    fn drop(&mut self) {
+        PROVIDER_BATCH_STATE.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn provider_batch_speed() -> &'static DownloadSpeedTracker {
+    &PROVIDER_BATCH_STATE.speed
+}
+
 pub(crate) async fn acquire_native_validation_permit()
 -> crate::Result<Option<SemaphorePermit<'static>>> {
     Ok(Some(FILE_VALIDATION_SEMAPHORE.acquire().await?))
@@ -5314,7 +5346,12 @@ async fn try_segmented_download(
         .await;
     let transfer_started = Instant::now();
     let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
-    let speed = DownloadSpeedTracker::default();
+    let owned_speed =
+        (!request.provider_script_policy).then(DownloadSpeedTracker::default);
+    let speed: &DownloadSpeedTracker = match owned_speed.as_ref() {
+        Some(speed) => speed,
+        None => provider_batch_speed(),
+    };
     let validator = Mutex::new(None);
     let redirect_target = AsyncMutex::new(None);
     let hedge_count = AtomicUsize::new(0);
@@ -6249,6 +6286,9 @@ async fn download_to_path_inner(
         wait_ms = lock_started.elapsed().as_millis(),
         "Acquired destination download lock"
     );
+    let _provider_batch = request
+        .provider_script_policy
+        .then(ProviderBatchGuard::acquire);
     let mode = source_mode_for_resource(request.resource);
     let mut routes = build_download_routes(&request, mode);
     let part_path = suffixed_path(destination, ".part");
