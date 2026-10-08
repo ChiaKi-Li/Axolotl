@@ -658,6 +658,7 @@ fn main() {
                         "instance_delete_group",
                         "instance_set_group_order",
                         "instance_set_group_memberships",
+                        "instance_update_group_memberships",
                     ])
                     .default_permission(
                         DefaultPermissionRule::AllowAllCommands,
