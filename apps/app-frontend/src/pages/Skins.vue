@@ -41,6 +41,7 @@ import { useNetworkStatus } from '@/composables/useNetworkStatus'
 import { check_reachable, get_default_user, users } from '@/helpers/auth'
 import type { RenderResult } from '@/helpers/rendering/batch-skin-renderer.ts'
 import { skinBlobUrlMap } from '@/helpers/rendering/batch-skin-renderer.ts'
+import { createSkinAccountSession } from '@/helpers/skin-account-session'
 import { loadSkinArmorPreview, saveSkinArmorPreview } from '@/helpers/skin-armor-preview'
 import type { Cape, Skin, SkinTextureUrl } from '@/helpers/skins.ts'
 import {
@@ -405,6 +406,8 @@ const hasPendingSkinChange = computed(
 let userCheckInterval: number | null = null
 let pendingSkinRefreshTimeout: number | null = null
 let isUnmounted = false
+const skinAccountSessions = createSkinAccountSession()
+let skinAccountGeneration = 0
 let unlistenNativeDrop: (() => void) | null = null
 let skinNavigationRevision = 0
 const skinNavigationRevisions = new WeakMap<object, number>()
@@ -470,19 +473,21 @@ async function deleteSkin() {
     }
 }
 
-async function loadCapes() {
+async function loadCapes(generation = skinAccountGeneration) {
     try {
-        capes.value = (await get_available_capes()) ?? []
+        const loadedCapes = (await get_available_capes()) ?? []
+        if (generation === skinAccountGeneration) capes.value = loadedCapes
     } catch (error) {
-        if (currentUser.value && error instanceof Error) {
+        if (generation === skinAccountGeneration && currentUser.value && error instanceof Error) {
             handleError(error)
         }
     }
 }
 
-async function loadSkins() {
+async function loadSkins(generation = skinAccountGeneration) {
     try {
         const loadedSkins = (await get_available_skins()) ?? []
+        if (generation !== skinAccountGeneration) return
         const loadedEquippedSkin = loadedSkins.find((s) => s.is_equipped)
         const locallyKnownEquippedSkin =
             originalSelectedSkin.value &&
@@ -495,15 +500,17 @@ async function loadSkins() {
             locallyKnownEquippedSkin &&
             !skinsMatch(loadedEquippedSkin, locallyKnownEquippedSkin)
 
-        skins.value =
+        const nextSkins =
             shouldPreserveKnownEquippedSkin && locallyKnownEquippedSkin
                 ? mergeEquippedSkin(loadedSkins, locallyKnownEquippedSkin)
                 : loadedSkins
-        generateSkinPreviews(skins.value, capes.value)
-        selectedSkin.value = skins.value.find((s) => s.is_equipped) ?? null
+        if (generation !== skinAccountGeneration) return
+        skins.value = nextSkins
+        void generateSkinPreviews(nextSkins, capes.value)
+        selectedSkin.value = nextSkins.find((s) => s.is_equipped) ?? null
         originalSelectedSkin.value = selectedSkin.value
     } catch (error) {
-        if (currentUser.value && error instanceof Error) {
+        if (generation === skinAccountGeneration && currentUser.value && error instanceof Error) {
             handleError(error)
         }
     }
@@ -835,9 +842,11 @@ async function applySelectedSkin() {
     )
         return
 
+    const generation = skinAccountGeneration
     isApplyingSkin.value = true
     try {
         await equip_skin(skinToApply)
+        if (generation !== skinAccountGeneration) return
         setLocallyEquippedSkin(skinToApply)
         schedulePendingSkinRefresh()
     } catch (error) {
@@ -870,27 +879,36 @@ async function onSkinSaved(options: { applied: boolean; skin?: Skin; previousSki
     }
 }
 
-async function loadCurrentUser() {
+async function loadCurrentUser(generation = skinAccountGeneration) {
     try {
         const defaultId = await get_default_user(offline.value)
-        currentUserId.value = defaultId
-
         const allAccounts = await users(offline.value)
+        if (generation !== skinAccountGeneration) return false
         const selectedAccount = allAccounts.find((acc) => acc.account_id === defaultId)
         currentAccountType.value = selectedAccount?.account_type
+        currentUserId.value = defaultId
         currentUser.value = selectedAccount
+        return true
     } catch (e) {
+        if (generation !== skinAccountGeneration) return false
         handleError(e as Error)
         currentUser.value = undefined
         currentUserId.value = undefined
         currentAccountType.value = undefined
+        return false
     }
 }
 
 async function refreshSelectedAccount() {
-    await loadCurrentUser()
-    await loadCapes()
-    await loadSkins()
+    const session = skinAccountSessions.begin()
+    const generation = ++skinAccountGeneration
+    skins.value = []
+    capes.value = []
+    selectedSkin.value = null
+    originalSelectedSkin.value = null
+    isApplyingSkin.value = false
+    if (!(await loadCurrentUser(generation)) || !skinAccountSessions.isCurrent(session)) return
+    await Promise.all([loadCapes(generation), loadSkins(generation)])
 }
 
 watch(accountChangeRevision, (revision, previousRevision) => {
@@ -1100,8 +1118,7 @@ async function checkUserChanges() {
     }
 }
 
-await Promise.all([loadCapes(), loadCurrentUser()])
-await loadSkins()
+await refreshSelectedAccount()
 </script>
 
 <template>
