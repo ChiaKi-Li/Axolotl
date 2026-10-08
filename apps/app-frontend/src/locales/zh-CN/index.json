@@ -1,4 +1,7 @@
 {
+  "app.settings.environment-variables.invalid-format": {
+    "message": "请使用 NAME=value 格式，以空格分隔。名称和等号不能为空；值可以为空，也可以包含更多等号。"
+  },
   "app.account.signed-in-as": {
     "message": "登录身份："
   },

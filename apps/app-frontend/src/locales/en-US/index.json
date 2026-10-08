@@ -1,4 +1,7 @@
 {
+  "app.settings.environment-variables.invalid-format": {
+    "message": "Use NAME=value, separated by spaces. A name and an equals sign are required; the value may be empty or contain more equals signs."
+  },
   "app.account.signed-in-as": {
     "message": "Signed in as"
   },
