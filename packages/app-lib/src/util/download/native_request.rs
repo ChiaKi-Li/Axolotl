@@ -30,6 +30,7 @@ pub(crate) fn byte_range_header_value(
 pub(crate) async fn send_path_request_with_clients(
     route: &DownloadRoute,
     custom_header: Option<&(String, String)>,
+    provider_headers: &[(String, String)],
     credentials: Option<&crate::state::ModrinthCredentials>,
     download_meta: Option<&DownloadMeta>,
     range_start: Option<u64>,
@@ -81,6 +82,9 @@ pub(crate) async fn send_path_request_with_clients(
         {
             request = request.header(name, value);
         }
+        for (name, value) in provider_headers {
+            request = request.header(name, value);
+        }
         if allow_sensitive && let Some(credentials) = credentials {
             request = request.header("Authorization", &credentials.session);
         }
@@ -93,9 +97,13 @@ pub(crate) async fn send_path_request_with_clients(
                 .header(DOWNLOAD_META_HEADER, download_meta.to_header_value());
         }
         if let Some(range) = byte_range_header_value(range_start, range_end) {
-            request = request
-                .header(header::RANGE, range)
-                .header(header::ACCEPT_ENCODING, "identity");
+            request = request.header(header::RANGE, range);
+            if !provider_headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("accept-encoding"))
+            {
+                request = request.header(header::ACCEPT_ENCODING, "identity");
+            }
         }
         let response = match request.send().await {
             Ok(response) => response,
@@ -200,6 +208,7 @@ pub(crate) async fn send_path_request_with_clients(
 pub(crate) async fn send_path_request(
     route: &DownloadRoute,
     custom_header: Option<&(String, String)>,
+    provider_headers: &[(String, String)],
     credentials: Option<&crate::state::ModrinthCredentials>,
     download_meta: Option<&DownloadMeta>,
     range_start: Option<u64>,
@@ -212,6 +221,7 @@ pub(crate) async fn send_path_request(
     send_path_request_with_clients(
         route,
         custom_header,
+        provider_headers,
         credentials,
         download_meta,
         range_start,

@@ -311,13 +311,10 @@ pub(crate) async fn generate_pack_from_version_id_with_reporter(
                 "Specified version has no files".to_string(),
             )
         })?;
-    let pack_urls =
-        crate::util::download::provider_policy::modrinth_resource_urls(
-            std::slice::from_ref(&pack_file.url),
-            version.game_versions.first().map(String::as_str),
-            version.loaders.first().map(String::as_str),
-            Some(modrinth_api_latency),
-        );
+    let pack_urls = crate::util::download::provider_policy::modrinth_pack_urls(
+        std::slice::from_ref(&pack_file.url),
+        Some(modrinth_api_latency),
+    );
     let Some(primary_pack_url) = pack_urls.first() else {
         return Err(crate::ErrorKind::InputError(
             "Modrinth returned an empty modpack URL list".to_string(),
@@ -424,6 +421,7 @@ pub(crate) async fn generate_pack_from_version_id_with_reporter(
     reporter.persist().await?;
     let download_result = download_to_path(
         DownloadRequest::new(primary_pack_url, ResourceClass::Modpack)
+            .with_provider_script_policy()
             .with_exact_candidate_urls(pack_urls.iter().skip(1).cloned())
             .with_integrity(Integrity {
                 size: Some(pack_file.size as u64),

@@ -8,12 +8,44 @@ const REQUIRED_SLOW_WINDOWS: u8 = 2;
 const MIN_REMAINING_BYTES: u64 = 1024 * 1024;
 const ABSOLUTE_SPEED_FLOOR: u64 = 16 * 1024;
 const COLD_SPEED_FLOOR: u64 = 256 * 1024;
+const SLOW_CHUNK_GAP: Duration = Duration::from_secs(5);
+const PROVIDER_TIMEOUT_MIN: Duration = Duration::from_secs(15);
+const PROVIDER_TIMEOUT_MAX: Duration = Duration::from_secs(30);
 const RECONNECT_OVERHEAD: Duration = Duration::from_millis(600);
 const MIN_SAVINGS: Duration = Duration::from_secs(2);
 #[cfg(not(test))]
 const IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 #[cfg(test)]
 const IDLE_TIMEOUT: Duration = Duration::from_millis(500);
+
+#[derive(Default)]
+pub(crate) struct SlowChunkDetector {
+    last_receive: Option<Instant>,
+}
+
+impl SlowChunkDetector {
+    pub(crate) fn should_kill(&self, chunk_bytes: usize, now: Instant) -> bool {
+        self.last_receive.is_some_and(|last_receive| {
+            let gap = now.duration_since(last_receive);
+            gap > SLOW_CHUNK_GAP && gap.as_millis() > chunk_bytes as u128
+        })
+    }
+
+    pub(crate) fn record_receive(&mut self, now: Instant) {
+        self.last_receive = Some(now);
+    }
+}
+
+pub(crate) fn provider_timeout(
+    average_connect_time: Option<Duration>,
+    source_failures: u32,
+) -> Duration {
+    let base = average_connect_time
+        .unwrap_or_default()
+        .max(PROVIDER_TIMEOUT_MIN);
+    base.saturating_mul(source_failures.saturating_add(1))
+        .min(PROVIDER_TIMEOUT_MAX)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SlowDecision {
@@ -148,6 +180,42 @@ fn estimated_duration(bytes: u64, speed: u64) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slow_chunk_detector_matches_the_script_gap_and_speed_rule() {
+        let started = Instant::now();
+        let mut detector = SlowChunkDetector::default();
+
+        assert!(!detector.should_kill(1, started));
+        detector.record_receive(started);
+        assert!(
+            !detector
+                .should_kill(5_001, started + Duration::from_millis(5_001))
+        );
+        assert!(
+            detector.should_kill(5_000, started + Duration::from_millis(5_001))
+        );
+        assert!(
+            !detector.should_kill(1, started + Duration::from_millis(5_000))
+        );
+    }
+
+    #[test]
+    fn provider_timeout_matches_the_script_adaptive_bounds() {
+        assert_eq!(provider_timeout(None, 0), Duration::from_secs(15));
+        assert_eq!(
+            provider_timeout(Some(Duration::from_secs(20)), 0),
+            Duration::from_secs(20)
+        );
+        assert_eq!(
+            provider_timeout(Some(Duration::from_secs(20)), 1),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            provider_timeout(Some(Duration::from_secs(40)), 0),
+            Duration::from_secs(30)
+        );
+    }
 
     #[test]
     fn local_pressure_does_not_trigger_route_switch_or_idle_failure() {

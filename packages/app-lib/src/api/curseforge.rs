@@ -584,6 +584,7 @@ pub(crate) async fn stage_curseforge_upgrade_file(
         reporter.map(|reporter| (reporter, tracking.as_str())),
         None,
         true,
+        true,
     )
     .await?;
     verify_installed_curseforge_file(&path, &file, None, None).await?;
@@ -1578,6 +1579,7 @@ pub async fn install_world_with_reporter(
         None,
         Some((&reporter, &tracking_path)),
         None,
+        true,
         true,
     )
     .await?;
@@ -8750,15 +8752,20 @@ async fn download_curseforge_path(
     tracking: Option<(&InstallProgressReporter, &str)>,
     h2_range_concurrency: Option<usize>,
     allow_http1_segmented_download: bool,
+    browser_headers: bool,
 ) -> crate::Result<crate::util::fetch::DownloadResult> {
     let state = State::get().await?;
     let urls = curseforge_candidate_urls(url)?;
     let primary_url = urls.first().map(String::as_str).unwrap_or(url);
     let mut request =
         DownloadRequest::new(primary_url, ResourceClass::CurseForge)
+            .with_provider_script_policy()
             .with_exact_candidate_urls(urls.iter().skip(1).cloned())
             .with_integrity(curseforge_integrity(file))
             .with_http1_segmented_download(allow_http1_segmented_download);
+    if browser_headers {
+        request = request.with_provider_browser_headers();
+    }
     if let Some(concurrency) = h2_range_concurrency {
         request = request.with_h2_range_concurrency(concurrency);
     }
@@ -8812,6 +8819,7 @@ async fn download_curseforge_archive(
         reporter.map(|reporter| (reporter, tracking_item_id.as_str())),
         curseforge_modpack_h2_range_concurrency(file.file_length),
         true,
+        false,
     )
     .await
 }
@@ -9387,6 +9395,7 @@ async fn download_installed_file(
             .map(|reporter| (reporter, relative_path.as_str())),
         None,
         false,
+        true,
     )
     .await?;
     if let Some(download_metrics) = download_metrics {

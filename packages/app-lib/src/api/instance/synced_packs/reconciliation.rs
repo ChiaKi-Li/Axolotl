@@ -312,10 +312,11 @@ async fn prepare_pack(
         if let Some(cached) = cached {
             cached
         } else {
-            let bytes = fetch::fetch(
+            let bytes = fetch::download_modrinth_pack_bytes(
                 &file.url,
+                Some(file.size as u64),
                 file.hashes.get("sha1").map(String::as_str),
-                None,
+                file.hashes.get("sha512").map(String::as_str),
                 None,
                 &state.fetch_semaphore,
                 &state.pool,

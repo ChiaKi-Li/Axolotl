@@ -5,7 +5,9 @@ use super::operations::{compose_instance, effective};
 use super::storage::{load_local, write_local_rows};
 use super::types::{LocalServer, ServerSource};
 use crate::state::{CachedEntry, InstanceLink, InstanceMetadata};
-use crate::util::fetch::{DownloadMeta, DownloadReason, fetch};
+use crate::util::fetch::{
+    DownloadMeta, DownloadReason, download_modrinth_pack_bytes,
+};
 use crate::{ErrorKind, State};
 use async_zip::base::read::seek::ZipFileReader;
 use quartz_nbt::NbtCompound;
@@ -159,11 +161,12 @@ pub(super) async fn reconstruct_modpack_servers(
         loader: metadata.applied_content_set.loader.as_str().to_string(),
         dependent_on: Some(version_id.to_string()),
     };
-    let mrpack = fetch(
+    let mrpack = download_modrinth_pack_bytes(
         &primary_file.url,
+        Some(primary_file.size as u64),
         primary_file.hashes.get("sha1").map(String::as_str),
-        Some(&download_meta),
-        None,
+        primary_file.hashes.get("sha512").map(String::as_str),
+        Some(download_meta),
         &state.api_semaphore,
         &state.pool,
     )

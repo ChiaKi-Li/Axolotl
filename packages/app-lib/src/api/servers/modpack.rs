@@ -480,7 +480,27 @@ async fn download_with_engine(
     resource: ResourceClass,
     progress: AggregateProgress,
 ) -> Result<()> {
-    let mut request = DownloadRequest::new(url, resource);
+    let provider_urls = if resource == ResourceClass::Modpack {
+        if url.to_ascii_lowercase().contains("forgecdn.net") {
+            crate::util::download::provider_policy::curseforge_download_urls(
+                url,
+            )
+        } else {
+            crate::util::download::provider_policy::modrinth_pack_urls(
+                std::slice::from_ref(&url.to_string()),
+                None,
+            )
+        }
+    } else {
+        vec![url.to_string()]
+    };
+    let primary_url = provider_urls.first().map(String::as_str).unwrap_or(url);
+    let mut request = DownloadRequest::new(primary_url, resource);
+    if resource == ResourceClass::Modpack {
+        request = request
+            .with_provider_script_policy()
+            .with_exact_candidate_urls(provider_urls.iter().skip(1).cloned());
+    }
     if let Some(sha1) = &sha1 {
         request = request.with_integrity(Integrity::sha1(sha1.clone()));
     }
@@ -649,7 +669,18 @@ async fn download_metadata_jar(
     destination: &Path,
     sha1: Option<String>,
 ) -> Result<()> {
-    let mut request = DownloadRequest::new(url, ResourceClass::Modpack);
+    let download_urls =
+        crate::util::download::provider_policy::modrinth_resource_urls(
+            &[url.to_string()],
+            None,
+            None,
+            None,
+        );
+    let primary_url = download_urls.first().map(String::as_str).unwrap_or(url);
+    let mut request = DownloadRequest::new(primary_url, ResourceClass::Modpack)
+        .with_provider_script_policy()
+        .with_provider_browser_headers()
+        .with_exact_candidate_urls(download_urls.iter().skip(1).cloned());
     if let Some(sha1) = &sha1 {
         request = request.with_integrity(Integrity::sha1(sha1.clone()));
     }

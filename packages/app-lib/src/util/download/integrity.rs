@@ -41,10 +41,18 @@ pub(crate) fn verify_computed_integrity(
     expected: &Integrity,
     actual: &ComputedIntegrity,
 ) -> crate::Result<()> {
+    verify_computed_integrity_with_size_policy(expected, actual, false)
+}
+
+pub(crate) fn verify_computed_integrity_with_size_policy(
+    expected: &Integrity,
+    actual: &ComputedIntegrity,
+    require_expected_size: bool,
+) -> crate::Result<()> {
     if let Some(size) = expected.size
         && actual.size != size
     {
-        if !expected.has_hash() {
+        if require_expected_size || !expected.has_hash() {
             return Err(ErrorKind::OtherError(format!(
                 "Incorrect size for download: {size} != {}",
                 actual.size
@@ -131,6 +139,21 @@ pub(crate) async fn verify_file(
 ) -> crate::Result<u64> {
     let computed = compute_file_integrity(path, integrity).await?;
     verify_computed_integrity(integrity, &computed)?;
+    validate_file_content(path, integrity.content).await?;
+    Ok(computed.size)
+}
+
+pub(crate) async fn verify_file_with_size_policy(
+    path: &Path,
+    integrity: &Integrity,
+    require_expected_size: bool,
+) -> crate::Result<u64> {
+    let computed = compute_file_integrity(path, integrity).await?;
+    verify_computed_integrity_with_size_policy(
+        integrity,
+        &computed,
+        require_expected_size,
+    )?;
     validate_file_content(path, integrity.content).await?;
     Ok(computed.size)
 }

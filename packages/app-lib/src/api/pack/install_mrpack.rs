@@ -1653,6 +1653,8 @@ pub(crate) async fn install_zipped_mrpack_files_with_reporter(
                 seed_mrpack_staged_download(&target_path, &download_path).await;
                 let download = match download_to_path(
                     DownloadRequest::new(primary_url, ResourceClass::Modpack)
+                        .with_provider_script_policy()
+                        .with_provider_browser_headers()
                         .with_exact_candidate_urls(
                             download_urls.iter().skip(1).cloned(),
                         )
@@ -1661,7 +1663,7 @@ pub(crate) async fn install_zipped_mrpack_files_with_reporter(
                             content_context.download_meta.clone(),
                         )
                         .with_segmented_download(true)
-                        .with_http1_segmented_download(false)
+                        .with_http1_segmented_download(true)
                         .with_install_tracking(
                             content_context.reporter.clone(),
                             project_path.clone(),

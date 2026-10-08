@@ -55,6 +55,17 @@ impl DownloadSpeedTracker {
     }
 
     pub fn speed_snapshot(&self) -> SpeedSnapshot {
+        self.speed_snapshot_with_provider_floor(false)
+    }
+
+    pub fn provider_speed_snapshot(&self) -> SpeedSnapshot {
+        self.speed_snapshot_with_provider_floor(true)
+    }
+
+    fn speed_snapshot_with_provider_floor(
+        &self,
+        provider_floor: bool,
+    ) -> SpeedSnapshot {
         let now = Instant::now();
         let total = self.completed_bytes.load(Ordering::Relaxed);
         let mut state = self.speed.lock();
@@ -82,7 +93,11 @@ impl DownloadSpeedTracker {
             }
             state.current_speed = weighted_total / weight_total.max(1);
 
-            if state.history.len() >= 5 {
+            if provider_floor && state.history.len() >= 10 {
+                let average = state.history.iter().take(10).sum::<u64>() / 10;
+                let limit = average.saturating_mul(85) / 100;
+                state.speed_floor = state.speed_floor.max(limit);
+            } else if !provider_floor && state.history.len() >= 5 {
                 let recent_count = state.history.len().min(10);
                 let recent_average =
                     state.history.iter().take(recent_count).sum::<u64>()

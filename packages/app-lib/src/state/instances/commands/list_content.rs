@@ -20,8 +20,8 @@ use crate::state::{
     ReleaseChannel, TeamMember, Version, VersionV3,
 };
 use crate::util::fetch::{
-    ContentValidation, DownloadMeta, DownloadReason, DownloadRequest,
-    FetchSemaphore, Integrity, ResourceClass, download_to_path, sha1_async,
+    DownloadMeta, DownloadReason, DownloadRequest, FetchSemaphore, Integrity,
+    ResourceClass, download_to_path, sha1_async,
 };
 use async_zip::tokio::read::fs::ZipFileReader;
 use dashmap::DashMap;
@@ -2602,13 +2602,25 @@ async fn get_modpack_identifiers(
         .join(&version.project_id)
         .join(version_id)
         .join(file_name);
+    let download_urls =
+        crate::util::download::provider_policy::modrinth_pack_urls(
+            std::slice::from_ref(&primary_file.url),
+            None,
+        );
+    let Some(primary_url) = download_urls.first() else {
+        return Err(crate::ErrorKind::InputError(
+            "Modrinth returned an empty modpack URL list".to_string(),
+        )
+        .into());
+    };
     download_to_path(
-        DownloadRequest::new(&primary_file.url, ResourceClass::Modpack)
+        DownloadRequest::new(primary_url, ResourceClass::Modpack)
+            .with_provider_script_policy()
+            .with_exact_candidate_urls(download_urls.iter().skip(1).cloned())
             .with_integrity(Integrity {
                 size: Some(primary_file.size as u64),
                 sha1: primary_file.hashes.get("sha1").cloned(),
                 sha512: primary_file.hashes.get("sha512").cloned(),
-                content: ContentValidation::Jar,
                 ..Integrity::default()
             })
             .with_download_meta(download_meta),

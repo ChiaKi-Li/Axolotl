@@ -1390,8 +1390,24 @@ async fn download_project_version_with_reporting(
     )
     .await?;
     let integrity = prepared.integrity.clone();
+    let download_urls =
+        crate::util::download::provider_policy::modrinth_resource_urls(
+            std::slice::from_ref(&prepared.url),
+            Some(prepared.download_meta.game_version.as_str()),
+            Some(prepared.download_meta.loader.as_str()),
+            None,
+        );
+    let Some(primary_url) = download_urls.first() else {
+        return Err(crate::ErrorKind::InputError(
+            "Modrinth returned an empty download URL list".to_string(),
+        )
+        .into());
+    };
     let mut request =
-        DownloadRequest::new(&prepared.url, ResourceClass::Modrinth)
+        DownloadRequest::new(primary_url, ResourceClass::Modrinth)
+            .with_provider_script_policy()
+            .with_provider_browser_headers()
+            .with_exact_candidate_urls(download_urls.iter().skip(1).cloned())
             .with_integrity(integrity.clone())
             .with_download_meta(prepared.download_meta);
     let tracking_reporter = progress
