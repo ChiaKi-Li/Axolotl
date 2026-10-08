@@ -3299,7 +3299,98 @@ enum SegmentedDownloadOutcome {
 enum SegmentDownloadError {
     Protocol(&'static str),
     Transport,
+    TransportStatus(u16),
     Fatal(crate::Error),
+}
+
+#[derive(Default)]
+struct ProviderSourceState {
+    sources: HashMap<String, ProviderSourceStats>,
+    received_bytes: u64,
+    connect_samples: Vec<time::Duration>,
+}
+
+#[derive(Default)]
+struct ProviderSourceStats {
+    failures: u32,
+    disabled: bool,
+}
+
+impl ProviderSourceState {
+    fn is_disabled(&self, route: &DownloadRoute) -> bool {
+        self.sources
+            .get(&route.url)
+            .is_some_and(|source| source.disabled)
+    }
+
+    fn failure_count(&self, route: &DownloadRoute) -> u32 {
+        self.sources
+            .get(&route.url)
+            .map(|source| source.failures)
+            .unwrap_or_default()
+    }
+
+    fn record_connect_sample(&mut self, sample: time::Duration) {
+        self.connect_samples.push(sample);
+    }
+
+    fn timeout_for(&self, route: &DownloadRoute) -> time::Duration {
+        let average = if self.connect_samples.is_empty() {
+            None
+        } else {
+            let total_ms = self
+                .connect_samples
+                .iter()
+                .map(|sample| sample.as_millis())
+                .sum::<u128>();
+            Some(time::Duration::from_millis(
+                (total_ms / self.connect_samples.len() as u128)
+                    .min(u128::from(u64::MAX)) as u64,
+            ))
+        };
+        crate::util::download::native_slow::provider_timeout(
+            average,
+            self.failure_count(route),
+        )
+    }
+
+    fn record_data(&mut self, route: &DownloadRoute, bytes: u64) {
+        self.received_bytes = self.received_bytes.saturating_add(bytes);
+        if let Some(source) = self.sources.get_mut(&route.url) {
+            source.failures = 0;
+        }
+    }
+
+    fn record_failure(
+        &mut self,
+        route: &DownloadRoute,
+        status: Option<u16>,
+        message: Option<&str>,
+        protocol_fatal: bool,
+        thread_limit: usize,
+    ) -> bool {
+        let source = self.sources.entry(route.url.clone()).or_default();
+        source.failures = source.failures.saturating_add(1);
+        let detail = message.unwrap_or_default().to_ascii_lowercase();
+        let url = route.url.to_ascii_lowercase();
+        let fatal = protocol_fatal
+            || status.is_some_and(|status| {
+                status == 404
+                    || status == 502
+                    || ((status == 403 || status == 429)
+                        && !url.contains("bmclapi"))
+                    || status == 416
+            })
+            || detail.contains("enotfound")
+            || detail.contains("no response received")
+            || (self.received_bytes == 0
+                && source.failures >= thread_limit.clamp(5, 30) as u32)
+            || source.failures > thread_limit.saturating_add(2) as u32;
+        if fatal {
+            source.disabled = true;
+        }
+        fatal
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -4327,6 +4418,7 @@ async fn download_segment_once(
     hedge_active: &AtomicBool,
     provider_script_policy: bool,
     request_timeout: time::Duration,
+    provider_sources: Option<&Arc<Mutex<ProviderSourceState>>>,
 ) -> Result<SegmentDownloadCompletion, SegmentDownloadError> {
     let _activity = crate::State::get_if_initialized()
         .map(|state| state.begin_download_connection());
@@ -4429,7 +4521,9 @@ async fn download_segment_once(
                 tokio::time::sleep(fetch_retry_delay(attempt)).await;
                 continue;
             }
-            return Err(SegmentDownloadError::Transport);
+            return Err(SegmentDownloadError::TransportStatus(
+                response.status().as_u16(),
+            ));
         }
         let content_length = response.content_length();
         if provider_script_policy {
@@ -4612,7 +4706,10 @@ async fn download_segment_once(
                                         SegmentDownloadError::Protocol(reason),
                                     );
                                 }
-                                Err(SegmentDownloadError::Transport) => {}
+                                Err(SegmentDownloadError::Transport)
+                                | Err(SegmentDownloadError::TransportStatus(
+                                    _,
+                                )) => {}
                             }
                         } else {
                             hedge_active.store(false, Ordering::Release);
@@ -4661,8 +4758,20 @@ async fn download_segment_once(
             } else {
                 chunk.len().max(1)
             }) {
+                if provider_script_policy
+                    && provider_sources.is_some_and(|sources| {
+                        sources.lock().is_disabled(route)
+                    })
+                {
+                    return Err(SegmentDownloadError::Transport);
+                }
                 if first_data_elapsed.is_none() {
                     first_data_elapsed = Some(request_started.elapsed());
+                    if let Some(provider_sources) = provider_sources {
+                        provider_sources
+                            .lock()
+                            .record_connect_sample(request_started.elapsed());
+                    }
                 }
                 if provider_script_policy
                     && slow_chunk_detector
@@ -4680,6 +4789,9 @@ async fn download_segment_once(
                 }
                 pending_progress += accepted as u64;
                 speed.record_bytes(accepted as u64);
+                if let Some(provider_sources) = provider_sources {
+                    provider_sources.lock().record_data(route, accepted as u64);
+                }
                 if pending_progress >= 256 * 1024
                     || last_progress_at.elapsed()
                         >= time::Duration::from_secs(1)
@@ -4772,6 +4884,7 @@ async fn download_segment(
     provider_script_policy: bool,
     request_timeout: time::Duration,
     candidate_routes: &[DownloadRoute],
+    provider_sources: Option<Arc<Mutex<ProviderSourceState>>>,
 ) -> Result<SegmentDownloadCompletion, SegmentDownloadError> {
     if !provider_script_policy {
         return download_segment_once(
@@ -4796,6 +4909,7 @@ async fn download_segment(
             hedge_active,
             false,
             request_timeout,
+            None,
         )
         .await;
     }
@@ -4803,6 +4917,12 @@ async fn download_segment(
     let mut permit = Some(permit);
     let mut last_error = None;
     for candidate in std::iter::once(route).chain(candidate_routes.iter()) {
+        if provider_sources
+            .as_ref()
+            .is_some_and(|sources| sources.lock().is_disabled(candidate))
+        {
+            continue;
+        }
         let current_permit = match permit.take() {
             Some(permit) => permit,
             None => match acquire_native_connection(candidate, semaphore).await
@@ -4813,6 +4933,10 @@ async fn download_segment(
                 }
             },
         };
+        let candidate_timeout = provider_sources
+            .as_ref()
+            .map(|sources| sources.lock().timeout_for(candidate))
+            .unwrap_or(request_timeout);
         match download_segment_once(
             candidate,
             range.clone(),
@@ -4834,7 +4958,8 @@ async fn download_segment(
             hedge_count,
             hedge_active,
             true,
-            request_timeout,
+            candidate_timeout,
+            provider_sources.as_ref(),
         )
         .await
         {
@@ -4842,7 +4967,35 @@ async fn download_segment(
             Err(error @ SegmentDownloadError::Fatal(_)) => {
                 return Err(error);
             }
-            Err(error) => last_error = Some(error),
+            Err(error) => {
+                if let SegmentDownloadError::Protocol(reason) = &error
+                    && *reason == "provider initial size unknown"
+                {
+                    return Err(error);
+                }
+                if let Some(provider_sources) = provider_sources.as_ref() {
+                    let (status, message, protocol_fatal) = match &error {
+                        SegmentDownloadError::Protocol(reason) => (
+                            None,
+                            Some(*reason),
+                            !matches!(*reason, "provider initial size unknown"),
+                        ),
+                        SegmentDownloadError::TransportStatus(status) => {
+                            (Some(*status), None, false)
+                        }
+                        SegmentDownloadError::Transport => (None, None, false),
+                        SegmentDownloadError::Fatal(_) => unreachable!(),
+                    };
+                    provider_sources.lock().record_failure(
+                        candidate,
+                        status,
+                        message,
+                        protocol_fatal,
+                        configured_semaphore_limit(semaphore),
+                    );
+                }
+                last_error = Some(error)
+            }
         }
     }
     Err(last_error.unwrap_or(SegmentDownloadError::Transport))
@@ -4862,6 +5015,7 @@ struct SegmentedDownloadContext<'a> {
     max_attempts: usize,
     allow_low_throughput_abort: bool,
     request_timeout: time::Duration,
+    provider_sources: Option<Arc<Mutex<ProviderSourceState>>>,
 }
 
 async fn finalize_segmented_output(
@@ -4964,11 +5118,20 @@ impl<'a> SegmentedDownloadContext<'a> {
             } else {
                 FILE_TRANSFER_FIRST_BYTE_TIMEOUT
             },
+            provider_sources: None,
         }
     }
 
     fn with_request_timeout(mut self, request_timeout: time::Duration) -> Self {
         self.request_timeout = request_timeout;
+        self
+    }
+
+    fn with_provider_sources(
+        mut self,
+        provider_sources: Arc<Mutex<ProviderSourceState>>,
+    ) -> Self {
+        self.provider_sources = Some(provider_sources);
         self
     }
 }
@@ -4991,6 +5154,7 @@ async fn try_segmented_download(
         max_attempts,
         allow_low_throughput_abort,
         request_timeout,
+        provider_sources,
     } = context;
     let configured_limit = configured_semaphore_limit(semaphore);
     let route_cap = if request.provider_script_policy {
@@ -5100,6 +5264,7 @@ async fn try_segmented_download(
             request.provider_script_policy,
             request_timeout,
             candidate_routes,
+            provider_sources.clone(),
         ));
     }
     tracing::debug!(
@@ -5237,6 +5402,7 @@ async fn try_segmented_download(
                             request.provider_script_policy,
                             request_timeout,
                             candidate_routes,
+                            provider_sources.clone(),
                         ));
                         ranges.push(new_range);
                     }
@@ -5388,6 +5554,7 @@ async fn try_segmented_download(
                             request.provider_script_policy,
                             request_timeout,
                             candidate_routes,
+                            provider_sources.clone(),
                         ));
                         ranges.push(new_range);
                         expansion_baseline = Some(snapshot.recent_average);
@@ -5414,7 +5581,8 @@ async fn try_segmented_download(
                     reason,
                 }
             }
-            SegmentDownloadError::Transport => {
+            SegmentDownloadError::Transport
+            | SegmentDownloadError::TransportStatus(_) => {
                 SegmentedDownloadOutcome::SourceFailed
             }
             SegmentDownloadError::Fatal(error) => {
@@ -6096,15 +6264,13 @@ async fn try_segmented_native_attempt(
                 session.file_attempt_budget,
                 allow_low_throughput_abort && !request.provider_script_policy,
             )
-            .with_request_timeout(session.provider_timeout(route)),
+            .with_request_timeout(session.provider_timeout(route))
+            .with_provider_sources(session.provider_sources.clone()),
             progress.as_deref_mut(),
         )
         .await
         {
             SegmentedDownloadOutcome::Success(result) => {
-                if request.provider_script_policy {
-                    session.provider_connect_samples.push(result.ttfb);
-                }
                 finalize_download(part_path, destination).await?;
                 if let Some(authority) = original_route_authority(route) {
                     crate::util::download::native_reputation::record_transport_success(
@@ -6322,9 +6488,7 @@ struct NativeDownloadSession {
     single_thread_routes: HashSet<String>,
     busted_for_route: Option<(usize, String)>,
     file_attempt_budget: usize,
-    provider_connect_samples: Vec<time::Duration>,
-    provider_source_failures: HashMap<String, u32>,
-    provider_fatal_sources: HashSet<String>,
+    provider_sources: Arc<Mutex<ProviderSourceState>>,
 }
 
 impl NativeDownloadSession {
@@ -6346,9 +6510,9 @@ impl NativeDownloadSession {
                 single_thread_routes: HashSet::new(),
                 busted_for_route: None,
                 file_attempt_budget: route_count.saturating_mul(3).max(1),
-                provider_connect_samples: Vec::new(),
-                provider_source_failures: HashMap::new(),
-                provider_fatal_sources: HashSet::new(),
+                provider_sources: Arc::new(Mutex::new(
+                    ProviderSourceState::default(),
+                )),
             },
             h2_failed_nonofficial,
         )
@@ -6362,81 +6526,58 @@ impl NativeDownloadSession {
     }
 
     fn provider_timeout(&self, route: &DownloadRoute) -> time::Duration {
-        let average_connect_time = if self.provider_connect_samples.is_empty() {
-            None
-        } else {
-            let total_ms = self
-                .provider_connect_samples
-                .iter()
-                .map(|sample| sample.as_millis())
-                .sum::<u128>();
-            Some(time::Duration::from_millis(
-                (total_ms / self.provider_connect_samples.len() as u128)
-                    .min(u128::from(u64::MAX)) as u64,
-            ))
-        };
-        let failures = self
-            .provider_source_failures
-            .get(&route.url)
-            .copied()
-            .unwrap_or_default();
-        crate::util::download::native_slow::provider_timeout(
-            average_connect_time,
-            failures,
-        )
+        self.provider_sources.lock().timeout_for(route)
     }
 
-    fn record_provider_source_failure(&mut self, route: &DownloadRoute) {
-        let failures = self
-            .provider_source_failures
-            .entry(route.url.clone())
-            .or_default();
-        *failures = failures.saturating_add(1);
+    fn provider_source_failure_count(&self, route: &DownloadRoute) -> u32 {
+        self.provider_sources.lock().failure_count(route)
     }
 
-    fn mark_provider_source_fatal(&mut self, route: &DownloadRoute) {
-        self.provider_fatal_sources.insert(route.url.clone());
+    fn provider_source_is_disabled(&self, route: &DownloadRoute) -> bool {
+        self.provider_sources.lock().is_disabled(route)
     }
 
-    fn provider_source_should_disable(
+    fn mark_provider_source_fatal(&self, route: &DownloadRoute) {
+        let _ = self.provider_sources.lock().record_failure(
+            route,
+            None,
+            None,
+            true,
+            usize::MAX,
+        );
+    }
+
+    fn record_provider_source_data(&self, route: &DownloadRoute, bytes: u64) {
+        self.provider_sources.lock().record_data(route, bytes);
+    }
+
+    fn record_provider_source_failure(
         &self,
         route: &DownloadRoute,
         thread_limit: usize,
-        no_data_received: bool,
     ) -> bool {
-        if self.provider_fatal_sources.contains(&route.url) {
-            return true;
-        }
-        let failures = self
-            .provider_source_failures
-            .get(&route.url)
-            .copied()
-            .unwrap_or_default();
-        let Some(error) = self.last_error.as_ref() else {
-            return false;
-        };
-        let status = match error.raw.as_ref() {
-            ErrorKind::FetchError(source) => {
-                source.status().map(|status| status.as_u16())
-            }
-            ErrorKind::HttpError { status, .. } => Some(*status),
-            ErrorKind::LabrinthError(source) => source.status,
-            _ => None,
-        };
-        let detail = format!("{error:?}").to_ascii_lowercase();
-        let source = route.url.to_ascii_lowercase();
-        status.is_some_and(|status| {
-            status == 404
-                || status == 502
-                || ((status == 403 || status == 429)
-                    && !source.contains("bmclapi"))
-        }) || detail.contains("enotfound")
-            || detail.contains("no response received")
-            || detail.contains("range not supported")
-            || status == Some(416)
-            || (no_data_received
-                && failures >= thread_limit.clamp(5, 30) as u32)
-            || failures > thread_limit.saturating_add(2) as u32
+        let (status, message) = self
+            .last_error
+            .as_ref()
+            .map(|error| {
+                let status = match error.raw.as_ref() {
+                    ErrorKind::FetchError(source) => {
+                        source.status().map(|status| status.as_u16())
+                    }
+                    ErrorKind::HttpError { status, .. } => Some(*status),
+                    ErrorKind::LabrinthError(source) => source.status,
+                    _ => None,
+                };
+                (status, format!("{error:?}"))
+            })
+            .unwrap_or((None, String::new()));
+        self.provider_sources.lock().record_failure(
+            route,
+            status,
+            Some(message.as_str()),
+            false,
+            thread_limit,
+        )
     }
 
     fn take_final_error(&mut self, request: &DownloadRequest) -> crate::Error {
@@ -6496,6 +6637,12 @@ async fn run_native_download_attempts(
         }
         let mut attempted_routes = Vec::new();
         for (route_index, route) in routes.iter().enumerate() {
+            if request.provider_script_policy
+                && !retry_with_single_thread
+                && session.provider_source_is_disabled(route)
+            {
+                continue;
+            }
             if session.terminal_routes.contains(&route.url) {
                 continue;
             }
@@ -6549,6 +6696,9 @@ async fn run_native_download_attempts(
             }
             session.partial_route_index = Some(route_index);
             let attempts_before_route = session.attempts;
+            let failures_before_route = request
+                .provider_script_policy
+                .then(|| session.provider_source_failure_count(route));
             let route_attempt = run_native_route_attempts(
                 &request,
                 destination,
@@ -6567,17 +6717,16 @@ async fn run_native_download_attempts(
                 && session.attempts > attempts_before_route
                 && matches!(route_attempt, NativeRouteAttempt::Continue)
             {
-                session.record_provider_source_failure(route);
-                let no_data_received = tokio::fs::metadata(&part_path)
-                    .await
-                    .map(|metadata| metadata.len() == 0)
-                    .unwrap_or(true);
-                if retry_with_single_thread
-                    || session.provider_source_should_disable(
+                if failures_before_route.is_some_and(|before| {
+                    session.provider_source_failure_count(route) == before
+                }) {
+                    session.record_provider_source_failure(
                         route,
                         configured_semaphore_limit(semaphore),
-                        no_data_received,
-                    )
+                    );
+                }
+                if retry_with_single_thread
+                    || session.provider_source_is_disabled(route)
                 {
                     session.terminal_routes.insert(route.url.clone());
                 } else {
@@ -7255,11 +7404,21 @@ async fn run_native_route_attempts(
         } else {
             create_download_file(part_path).await?
         };
-        let response_length = response.content_length().unwrap_or(0);
-        let total_size = request
-            .integrity
-            .size
-            .unwrap_or(starting_size.saturating_add(response_length));
+        let response_length = response.content_length();
+        let provider_transfer_size =
+            request.provider_script_policy.then(|| {
+                response_length
+                    .map(|length| starting_size.saturating_add(length))
+            });
+        let total_size = if request.provider_script_policy {
+            provider_transfer_size
+                .flatten()
+                .unwrap_or(request.integrity.size.unwrap_or(starting_size))
+        } else {
+            request.integrity.size.unwrap_or(
+                starting_size.saturating_add(response_length.unwrap_or(0)),
+            )
+        };
         let transfer_started = Instant::now();
         let mut downloaded = starting_size;
         let mut last_tracking_bytes = starting_size;
@@ -7316,8 +7475,9 @@ async fn run_native_route_attempts(
                     };
                     if request.provider_script_policy && !provider_sample_recorded {
                         session
-                            .provider_connect_samples
-                            .push(request_started.elapsed());
+                            .provider_sources
+                            .lock()
+                            .record_connect_sample(request_started.elapsed());
                         provider_sample_recorded = true;
                     }
                     for packet in chunk.chunks(if request.provider_script_policy {
@@ -7325,6 +7485,15 @@ async fn run_native_route_attempts(
                     } else {
                         chunk.len().max(1)
                     }) {
+                        let packet = if let Some(limit) = provider_transfer_size.flatten() {
+                            let remaining = limit.saturating_sub(downloaded);
+                            if remaining == 0 {
+                                break;
+                            }
+                            &packet[..packet.len().min(remaining as usize)]
+                        } else {
+                            packet
+                        };
                         if request.provider_script_policy
                             && !retry_with_single_thread
                             && slow_chunk_detector
@@ -7349,6 +7518,10 @@ async fn run_native_route_attempts(
                         hashers.update(packet);
                         downloaded += packet.len() as u64;
                         if request.provider_script_policy {
+                            session.record_provider_source_data(
+                                route,
+                                packet.len() as u64,
+                            );
                             slow_chunk_detector.record_receive(Instant::now());
                         }
                         if let Some(state) = crate::State::get_if_initialized() {
@@ -7372,6 +7545,9 @@ async fn run_native_route_attempts(
                         }
                     }
                     if transfer_error.is_some() {
+                        break;
+                    }
+                    if provider_transfer_size.flatten().is_some_and(|limit| downloaded >= limit) {
                         break;
                     }
                 }
@@ -7521,8 +7697,37 @@ async fn run_native_route_attempts(
             break;
         }
 
+        if let Some(expected_transfer_size) = provider_transfer_size.flatten()
+            && downloaded < expected_transfer_size
+        {
+            let error: crate::Error = ErrorKind::OtherError(format!(
+                "Truncated provider response from {log_url}: received {downloaded} of {expected_transfer_size} bytes"
+            ))
+            .into();
+            record_route_failure(route, request.resource, None);
+            preserve_or_remove_partial(
+                part_path,
+                &request.integrity,
+                any_route_can_resume(routes),
+            )
+            .await?;
+            record_download_attempt_failure(
+                &mut session.attempt_history,
+                route,
+                session.attempts,
+                &error,
+                "resume_or_switch",
+                Some(status),
+                remote_addr,
+                Some(http_version),
+            );
+            session.last_error = Some(error);
+            break;
+        }
+
         if let Some(expected) = expected_size
             && downloaded < expected
+            && !request.provider_script_policy
             && !request.integrity.has_hash()
         {
             // No hash to fall back on: a close-delimited body that
@@ -9435,6 +9640,59 @@ mod tests {
     }
 
     #[test]
+    fn provider_source_state_matches_script_failure_reset_and_disable() {
+        let first = route(
+            "https://cdn.modrinth.com/data/first.jar".to_string(),
+            DownloadRouteSource::Official,
+            false,
+            true,
+        );
+        let second = route(
+            "https://cdn.modrinth.com/data/second.jar".to_string(),
+            DownloadRouteSource::Official,
+            false,
+            true,
+        );
+        let mut state = ProviderSourceState::default();
+        for _ in 0..4 {
+            assert!(!state.record_failure(&first, None, None, false, 4));
+        }
+        assert!(state.record_failure(&first, None, None, false, 4));
+        assert!(state.is_disabled(&first));
+        assert!(!state.is_disabled(&second));
+
+        state.record_data(&second, 16 * 1024);
+        assert_eq!(state.failure_count(&second), 0);
+        assert!(state.record_failure(
+            &second,
+            Some(404),
+            Some("HTTP 404"),
+            false,
+            4,
+        ));
+        assert!(state.is_disabled(&second));
+    }
+
+    #[test]
+    fn provider_source_state_keeps_bmclapi_rate_limits_retriable() {
+        let bmclapi = route(
+            "https://bmclapi.example/file.jar".to_string(),
+            DownloadRouteSource::Bmclapi,
+            true,
+            true,
+        );
+        let mut state = ProviderSourceState::default();
+        assert!(!state.record_failure(
+            &bmclapi,
+            Some(429),
+            Some("HTTP 429"),
+            false,
+            64,
+        ));
+        assert!(!state.is_disabled(&bmclapi));
+    }
+
+    #[test]
     fn route_probe_requires_a_twenty_five_percent_improvement() {
         assert!(!probe_is_meaningfully_faster(1_249_999, 1_000_000));
         assert!(probe_is_meaningfully_faster(1_250_000, 1_000_000));
@@ -10088,6 +10346,7 @@ mod tests {
             false,
             FILE_TRANSFER_FIRST_BYTE_TIMEOUT,
             &[],
+            None,
         )
         .await;
         assert!(matches!(
