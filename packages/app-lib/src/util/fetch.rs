@@ -4617,13 +4617,21 @@ async fn download_segment_once(
     let request_started = Instant::now();
     let mut pending_progress = 0_u64;
     let mut last_progress_at = time::Instant::now();
+    macro_rules! return_segment_error {
+        ($error:expr) => {{
+            if pending_progress > 0 {
+                let _ = progress.send(std::mem::take(&mut pending_progress));
+            }
+            return Err($error);
+        }};
+    }
     let mut final_url = route.url.clone();
     let mut remote_addr = None;
     let mut http_version = None;
     let mut first_data_elapsed = None;
     for attempt in 1..=SEGMENT_RETRY_ATTEMPTS {
         if cancellation.is_some_and(|token| token.is_cancelled()) {
-            return Err(SegmentDownloadError::Transport);
+            return_segment_error!(SegmentDownloadError::Transport);
         }
         first_data_elapsed = None;
         let requested_start = range.start + {
@@ -4668,7 +4676,7 @@ async fn download_segment_once(
         let response = if let Some(cancellation) = cancellation {
             tokio::select! {
                 _ = cancellation.cancelled() => {
-                    return Err(SegmentDownloadError::Transport);
+                    return_segment_error!(SegmentDownloadError::Transport);
                 }
                 response = response_future => response,
             }
@@ -4691,7 +4699,9 @@ async fn download_segment_once(
                 tokio::time::sleep(fetch_retry_delay(attempt)).await;
                 continue;
             }
-            Ok(Err(_)) | Err(_) => return Err(SegmentDownloadError::Transport),
+            Ok(Err(_)) | Err(_) => {
+                return_segment_error!(SegmentDownloadError::Transport)
+            }
         };
         final_url = response_url;
         let parsed_content_range = parse_content_range(&response);
@@ -4710,12 +4720,12 @@ async fn download_segment_once(
             "Received download range response"
         );
         if response.status() == StatusCode::OK && !provider_first_stream {
-            return Err(SegmentDownloadError::Protocol(
+            return_segment_error!(SegmentDownloadError::Protocol(
                 "server ignored Range and returned 200",
             ));
         }
         if response.status() == StatusCode::RANGE_NOT_SATISFIABLE {
-            return Err(SegmentDownloadError::Protocol(
+            return_segment_error!(SegmentDownloadError::Protocol(
                 "server returned HTTP 416 for range request",
             ));
         }
@@ -4726,7 +4736,7 @@ async fn download_segment_once(
                 tokio::time::sleep(fetch_retry_delay(attempt)).await;
                 continue;
             }
-            return Err(SegmentDownloadError::TransportStatus(
+            return_segment_error!(SegmentDownloadError::TransportStatus(
                 response.status().as_u16(),
             ));
         }
@@ -4735,11 +4745,11 @@ async fn download_segment_once(
             let expected_length = total_size.saturating_sub(requested_start);
             if content_length != Some(expected_length) {
                 if provider_first_stream && content_length.is_none() {
-                    return Err(SegmentDownloadError::Protocol(
+                    return_segment_error!(SegmentDownloadError::Protocol(
                         "provider initial size unknown",
                     ));
                 }
-                return Err(SegmentDownloadError::Protocol(
+                return_segment_error!(SegmentDownloadError::Protocol(
                     "invalid provider Content-Length",
                 ));
             }
@@ -4751,7 +4761,7 @@ async fn download_segment_once(
                         && range.total.is_none_or(|total| total == total_size)
                 });
             if !content_range_matches {
-                return Err(SegmentDownloadError::Protocol(
+                return_segment_error!(SegmentDownloadError::Protocol(
                     "invalid Content-Range",
                 ));
             }
@@ -4759,7 +4769,7 @@ async fn download_segment_once(
         if !provider_script_policy
             && !validate_resource_version(validator, &response)
         {
-            return Err(SegmentDownloadError::Protocol(
+            return_segment_error!(SegmentDownloadError::Protocol(
                 "resource validator changed between ranges",
             ));
         }
@@ -4786,8 +4796,8 @@ async fn download_segment_once(
             let tail_eligible = range.remaining() <= tail_threshold;
             let next_chunk = if let Some(cancellation) = cancellation {
                 tokio::select! {
-                    _ = cancellation.cancelled() => {
-                        return Err(SegmentDownloadError::Transport);
+                _ = cancellation.cancelled() => {
+                        return_segment_error!(SegmentDownloadError::Transport);
                     }
                     result = tokio::time::timeout(
                         if provider_script_policy {
@@ -4817,7 +4827,7 @@ async fn download_segment_once(
                 Ok(Some(chunk)) => chunk,
                 Ok(None) => break,
                 Err(_) if provider_script_policy => {
-                    return Err(SegmentDownloadError::Transport);
+                    return_segment_error!(SegmentDownloadError::Transport);
                 }
                 Err(_) if tail_eligible => {
                     let hedge_start =
@@ -4920,13 +4930,13 @@ async fn download_segment_once(
                                     break;
                                 }
                                 Err(SegmentDownloadError::Fatal(error)) => {
-                                    return Err(SegmentDownloadError::Fatal(
-                                        error,
-                                    ));
+                                    return_segment_error!(
+                                        SegmentDownloadError::Fatal(error)
+                                    );
                                 }
                                 Err(SegmentDownloadError::Protocol(reason)) => {
-                                    return Err(
-                                        SegmentDownloadError::Protocol(reason),
+                                    return_segment_error!(
+                                        SegmentDownloadError::Protocol(reason)
                                     );
                                 }
                                 Err(SegmentDownloadError::Transport)
@@ -4986,7 +4996,7 @@ async fn download_segment_once(
                         sources.lock().is_disabled(route)
                     })
                 {
-                    return Err(SegmentDownloadError::Transport);
+                    return_segment_error!(SegmentDownloadError::Transport);
                 }
                 if first_data_elapsed.is_none() {
                     first_data_elapsed = Some(request_started.elapsed());
@@ -5000,7 +5010,7 @@ async fn download_segment_once(
                     && slow_chunk_detector
                         .should_kill(packet.len(), Instant::now())
                 {
-                    return Err(SegmentDownloadError::Transport);
+                    return_segment_error!(SegmentDownloadError::Transport);
                 }
                 let (accepted, packet_completed) =
                     range.accept_chunk(packet.len());
@@ -5064,13 +5074,13 @@ async fn download_segment_once(
             tokio::time::sleep(fetch_retry_delay(attempt)).await;
             continue;
         }
-        return Err(SegmentDownloadError::Transport);
+        return_segment_error!(SegmentDownloadError::Transport);
     }
     if pending_progress > 0 {
         let _ = progress.send(pending_progress);
     }
     if !range.finish() {
-        return Err(SegmentDownloadError::Protocol(
+        return_segment_error!(SegmentDownloadError::Protocol(
             "range response ended before expected boundary",
         ));
     }

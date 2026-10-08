@@ -281,6 +281,7 @@ async fn run_modpack_install(
         None,
         None,
         false,
+        1,
         AggregateProgress::new(0),
     )
     .await?;
@@ -385,6 +386,7 @@ async fn run_modpack_install(
                     game_version.as_deref(),
                     loader.as_deref(),
                     true,
+                    num_files,
                     progress.clone(),
                 )
                 .await?;
@@ -514,6 +516,7 @@ async fn download_with_engine(
     game_version: Option<&str>,
     loader: Option<&str>,
     browser_headers: bool,
+    provider_batch_size: usize,
     progress: AggregateProgress,
 ) -> Result<()> {
     let provider_urls = match resource {
@@ -545,6 +548,7 @@ async fn download_with_engine(
     if matches!(resource, ResourceClass::Modrinth | ResourceClass::Modpack) {
         request = request
             .with_provider_script_policy()
+            .with_provider_batch_size(provider_batch_size)
             .with_exact_candidate_urls(provider_urls.iter().skip(1).cloned());
         if browser_headers {
             request = request.with_provider_browser_headers();

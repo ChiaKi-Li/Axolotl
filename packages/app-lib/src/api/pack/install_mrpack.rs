@@ -1246,7 +1246,19 @@ pub(crate) async fn install_zipped_mrpack_files_with_reporter(
             .iter()
             .map(|&index| (index, pack_files[index].clone()))
             .collect::<Vec<_>>();
-        let provider_batch_size = tasks.len().max(1);
+        let provider_batch_size = tasks
+            .iter()
+            .filter(|(_, project)| {
+                let project_path =
+                    content_context.resolve_install_path(project);
+                !skipped_missing_content_paths.contains(&project_path)
+                    && !project.env.as_ref().is_some_and(|env| {
+                        env.get(&EnvType::Client)
+                            .is_some_and(|side| side == &SideType::Unsupported)
+                    })
+            })
+            .count()
+            .max(1);
         let finalize_semaphore =
             Arc::new(Semaphore::new(NATIVE_CONTENT_FINALIZE_CONCURRENCY));
         let (completion_tx, mut completion_rx) =
