@@ -89,7 +89,16 @@ brew install --cask ChiaKi-Li/cask/axolotl-launcher
 brew install --cask --adopt ChiaKi-Li/cask/axolotl-launcher
 ```
 
-接管前请确认已安装版本与 Cask 提供的版本一致。可以通过 `brew info --cask ChiaKi-Li/cask/axolotl-launcher` 查看 Cask 版本。
+接管前，建议先更新 tap 信息，再查看 Cask 提供的版本：
+
+```bash
+brew update
+brew info --cask ChiaKi-Li/cask/axolotl-launcher
+```
+
+这里显示的是 Cask 提供的版本，不是手动安装的应用版本；请在应用的版本信息页面查看本地版本并进行对比。如果本地版本较旧，请先通过应用自身的更新功能或官方发布页面更新到 Cask 对应的版本，再尝试接管；如果本地版本较新，请等待 tap 更新后再尝试，无需为接管而降级。
+
+`--adopt` 用于接管已有应用，本身不负责升级旧版应用。版本号相同也不保证一定能接管；如果 Homebrew 提示已有应用与待安装应用不一致，请检查应用来源、版本和安装位置，不要用 `--force` 绕过检查。
 
 <details>
 <summary><b>Linux 包管理器快捷安装指令</b></summary>
