@@ -83,6 +83,14 @@ _(注：本项目是调用 Modrinth 公开 API 的独立客户端，与 Rinth, I
 brew install --cask ChiaKi-Li/cask/axolotl-launcher
 ```
 
+如果已通过 DMG 将应用安装到 `/Applications/Axolotl Launcher.app`，可以使用 `--adopt` 让 Homebrew 接管现有应用：
+
+```bash
+brew install --cask --adopt ChiaKi-Li/cask/axolotl-launcher
+```
+
+接管前请确认已安装版本与 Cask 提供的版本一致。可以通过 `brew info --cask ChiaKi-Li/cask/axolotl-launcher` 查看 Cask 版本。
+
 <details>
 <summary><b>Linux 包管理器快捷安装指令</b></summary>
 <br>
