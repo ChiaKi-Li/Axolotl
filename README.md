@@ -75,6 +75,14 @@ _(注：本项目是调用 Modrinth 公开 API 的独立客户端，与 Rinth, I
 | **macOS**               | 下载 `通用 .dmg` 镜像文件                 |
 | **Linux** (x64)         | 提供 `.AppImage`，`.deb`，`.rpm` 多种格式 |
 
+### macOS：Homebrew
+
+可以通过社区维护的非官方 [ChiaKi-Li/cask tap](https://github.com/ChiaKi-Li/homebrew-cask) 安装：
+
+```bash
+brew install --cask ChiaKi-Li/cask/axolotl-launcher
+```
+
 <details>
 <summary><b>Linux 包管理器快捷安装指令</b></summary>
 <br>
