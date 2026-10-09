@@ -3,6 +3,7 @@
 use crate::util::io::{self, IOError};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt, BufWriter, SeekFrom};
 
@@ -24,7 +25,8 @@ static RANGE_WRITE_TEST_PROBE: std::sync::Mutex<
 /// never serializes unrelated ranges behind a file mutex.
 pub(crate) struct RangeOutput {
     path: PathBuf,
-    size: u64,
+    size: AtomicU64,
+    size_known: AtomicBool,
 }
 
 /// An independent sequential writer for one half-open byte range.
@@ -51,7 +53,8 @@ impl RangeOutput {
         }
         Ok(Arc::new(Self {
             path: path.to_path_buf(),
-            size,
+            size: AtomicU64::new(size),
+            size_known: AtomicBool::new(true),
         }))
     }
     pub(crate) async fn create(
@@ -78,8 +81,69 @@ impl RangeOutput {
         .map_err(|error| io::io_error_with_lock_info(error, path))?;
         Ok(Arc::new(Self {
             path: path.to_path_buf(),
-            size,
+            size: AtomicU64::new(size),
+            size_known: AtomicBool::new(true),
         }))
+    }
+
+    pub(crate) async fn create_unknown_size(
+        path: &Path,
+    ) -> Result<Arc<Self>, IOError> {
+        io::retry_windows_sharing_violation(
+            path,
+            "creating ranged download output",
+            || async {
+                OpenOptions::new()
+                    .create(true)
+                    .truncate(true)
+                    .read(true)
+                    .write(true)
+                    .open(path)
+                    .await?;
+                Ok(())
+            },
+        )
+        .await
+        .map_err(|error| io::io_error_with_lock_info(error, path))?;
+        Ok(Arc::new(Self {
+            path: path.to_path_buf(),
+            size: AtomicU64::new(0),
+            size_known: AtomicBool::new(false),
+        }))
+    }
+
+    pub(crate) fn size(&self) -> u64 {
+        self.size.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn size_known(&self) -> bool {
+        self.size_known.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn mark_size_unknown(&self) {
+        self.size_known.store(false, Ordering::Release);
+    }
+
+    pub(crate) fn mark_size_known(&self) {
+        self.size_known.store(true, Ordering::Release);
+    }
+
+    pub(crate) async fn resize(&self, size: u64) -> Result<(), IOError> {
+        let path = self.path.clone();
+        io::retry_windows_sharing_violation(
+            &path,
+            "resizing ranged download output",
+            || async {
+                let file = OpenOptions::new().write(true).open(&path).await?;
+                super::local_resources::write(&path, 0, file.set_len(size))
+                    .await
+            },
+        )
+        .await
+        .map_err(|error| io::io_error_with_lock_info(error, &path))?;
+        self.size.store(size, Ordering::Release);
+        self.size_known.store(true, Ordering::Release);
+        Ok(())
     }
 
     pub(crate) async fn open_range(
@@ -87,7 +151,9 @@ impl RangeOutput {
         start: u64,
         end_exclusive: u64,
     ) -> Result<RangeWriter, IOError> {
-        if start >= end_exclusive || end_exclusive > self.size {
+        if start >= end_exclusive
+            || (end_exclusive != u64::MAX && end_exclusive > self.size())
+        {
             return Err(IOError::with_path(
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
@@ -165,6 +231,10 @@ impl RangeWriter {
 
     pub(crate) fn remaining(&self) -> u64 {
         self.end_exclusive.saturating_sub(self.offset)
+    }
+
+    pub(crate) fn set_end_exclusive(&mut self, end_exclusive: u64) {
+        self.end_exclusive = end_exclusive;
     }
 
     pub(crate) async fn write_next(

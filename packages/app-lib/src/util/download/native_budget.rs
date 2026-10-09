@@ -7,6 +7,7 @@ use std::sync::{Arc, LazyLock};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
 const MAX_CONNECTIONS_PER_AUTHORITY: usize = 32;
+const MAX_PROVIDER_CONNECTIONS_PER_AUTHORITY: usize = 128;
 const MAX_PHYSICAL_CONNECTIONS: usize = 256;
 static PHYSICAL_CONNECTIONS: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(MAX_PHYSICAL_CONNECTIONS)));
@@ -15,6 +16,7 @@ static PHYSICAL_CONNECTIONS: LazyLock<Arc<Semaphore>> =
 struct AuthorityKey {
     authority: String,
     proxy: ProxyPolicy,
+    connection_limit: usize,
 }
 
 static AUTHORITY_BUDGETS: LazyLock<
@@ -26,11 +28,15 @@ pub(crate) struct NativeBudgetPermit {
     _global: OwnedSemaphorePermit,
 }
 
-fn budget(route: &DownloadRoute) -> Option<Arc<Semaphore>> {
+fn budget(
+    route: &DownloadRoute,
+    connection_limit: usize,
+) -> Option<Arc<Semaphore>> {
     let authority = crate::util::fetch::url_authority(&route.url)?;
     let key = AuthorityKey {
         authority: super::proxy_context::authority_key(&authority, route.proxy),
         proxy: route.proxy,
+        connection_limit,
     };
     let mut budgets = AUTHORITY_BUDGETS.lock();
     if budgets.len() >= 256 {
@@ -39,9 +45,7 @@ fn budget(route: &DownloadRoute) -> Option<Arc<Semaphore>> {
     Some(
         budgets
             .entry(key)
-            .or_insert_with(|| {
-                Arc::new(Semaphore::new(MAX_CONNECTIONS_PER_AUTHORITY))
-            })
+            .or_insert_with(|| Arc::new(Semaphore::new(connection_limit)))
             .clone(),
     )
 }
@@ -49,14 +53,39 @@ fn budget(route: &DownloadRoute) -> Option<Arc<Semaphore>> {
 pub(crate) async fn acquire(
     route: &DownloadRoute,
 ) -> Result<NativeBudgetPermit, tokio::sync::AcquireError> {
-    acquire_with_global(route, &PHYSICAL_CONNECTIONS).await
+    acquire_with_global_limit(
+        route,
+        &PHYSICAL_CONNECTIONS,
+        MAX_CONNECTIONS_PER_AUTHORITY,
+    )
+    .await
+}
+
+pub(crate) async fn acquire_provider(
+    route: &DownloadRoute,
+) -> Result<NativeBudgetPermit, tokio::sync::AcquireError> {
+    acquire_with_global_limit(
+        route,
+        &PHYSICAL_CONNECTIONS,
+        MAX_PROVIDER_CONNECTIONS_PER_AUTHORITY,
+    )
+    .await
 }
 
 async fn acquire_with_global(
     route: &DownloadRoute,
     global: &Arc<Semaphore>,
 ) -> Result<NativeBudgetPermit, tokio::sync::AcquireError> {
-    let authority = match budget(route) {
+    acquire_with_global_limit(route, global, MAX_CONNECTIONS_PER_AUTHORITY)
+        .await
+}
+
+async fn acquire_with_global_limit(
+    route: &DownloadRoute,
+    global: &Arc<Semaphore>,
+    connection_limit: usize,
+) -> Result<NativeBudgetPermit, tokio::sync::AcquireError> {
+    let authority = match budget(route, connection_limit) {
         Some(budget) => {
             if budget.available_permits() == 0 {
                 super::h2_pool::evict_idle_connections(Some(
@@ -85,8 +114,28 @@ pub(crate) async fn acquire_many(
     route: &DownloadRoute,
     count: usize,
 ) -> Result<Vec<NativeBudgetPermit>, tokio::sync::AcquireError> {
-    let count = count.min(MAX_CONNECTIONS_PER_AUTHORITY);
-    let mut authority = match budget(route) {
+    acquire_many_with_limit(route, count, MAX_CONNECTIONS_PER_AUTHORITY).await
+}
+
+pub(crate) async fn acquire_many_provider(
+    route: &DownloadRoute,
+    count: usize,
+) -> Result<Vec<NativeBudgetPermit>, tokio::sync::AcquireError> {
+    acquire_many_with_limit(
+        route,
+        count,
+        MAX_PROVIDER_CONNECTIONS_PER_AUTHORITY,
+    )
+    .await
+}
+
+async fn acquire_many_with_limit(
+    route: &DownloadRoute,
+    count: usize,
+    connection_limit: usize,
+) -> Result<Vec<NativeBudgetPermit>, tokio::sync::AcquireError> {
+    let count = count.min(connection_limit);
+    let mut authority = match budget(route, connection_limit) {
         Some(budget) => {
             if budget.available_permits() < count {
                 super::h2_pool::evict_idle_connections(Some(
@@ -99,9 +148,7 @@ pub(crate) async fn acquire_many(
             }
             Some(
                 budget
-                    .acquire_many_owned(
-                        count.min(MAX_CONNECTIONS_PER_AUTHORITY) as u32,
-                    )
+                    .acquire_many_owned(count.min(connection_limit) as u32)
                     .await?,
             )
         }
@@ -114,7 +161,7 @@ pub(crate) async fn acquire_many(
         .clone()
         .acquire_many_owned(count as u32)
         .await?;
-    Ok((0..count.min(MAX_CONNECTIONS_PER_AUTHORITY))
+    Ok((0..count.min(connection_limit))
         .map(|_| NativeBudgetPermit {
             _global: global
                 .split(1)
@@ -131,9 +178,22 @@ pub(crate) async fn acquire_many(
 pub(crate) fn try_acquire(
     route: &DownloadRoute,
 ) -> Result<NativeBudgetPermit, TryAcquireError> {
+    try_acquire_with_limit(route, MAX_CONNECTIONS_PER_AUTHORITY)
+}
+
+pub(crate) fn try_acquire_provider(
+    route: &DownloadRoute,
+) -> Result<NativeBudgetPermit, TryAcquireError> {
+    try_acquire_with_limit(route, MAX_PROVIDER_CONNECTIONS_PER_AUTHORITY)
+}
+
+fn try_acquire_with_limit(
+    route: &DownloadRoute,
+    connection_limit: usize,
+) -> Result<NativeBudgetPermit, TryAcquireError> {
     Ok(NativeBudgetPermit {
         _global: PHYSICAL_CONNECTIONS.clone().try_acquire_owned()?,
-        _authority: match budget(route) {
+        _authority: match budget(route, connection_limit) {
             Some(budget) => Some(budget.try_acquire_owned()?),
             None => None,
         },
@@ -141,9 +201,16 @@ pub(crate) fn try_acquire(
 }
 
 pub(crate) fn available(route: &DownloadRoute) -> usize {
-    budget(route)
+    available_with_limit(route, MAX_CONNECTIONS_PER_AUTHORITY)
+}
+
+fn available_with_limit(
+    route: &DownloadRoute,
+    connection_limit: usize,
+) -> usize {
+    budget(route, connection_limit)
         .map(|budget| budget.available_permits())
-        .unwrap_or(MAX_CONNECTIONS_PER_AUTHORITY)
+        .unwrap_or(connection_limit)
         .min(PHYSICAL_CONNECTIONS.available_permits())
 }
 
@@ -195,5 +262,27 @@ mod tests {
         ));
         drop(permits);
         assert!(try_acquire(&route).is_ok());
+    }
+
+    #[tokio::test]
+    async fn provider_authority_budget_matches_launcher_concurrency() {
+        let mut route = route();
+        route.url = "https://provider-budget.example/file".into();
+        let global = Arc::new(Semaphore::new(64));
+        let mut permits = Vec::new();
+        for _ in 0..64 {
+            permits.push(
+                acquire_with_global_limit(
+                    &route,
+                    &global,
+                    MAX_PROVIDER_CONNECTIONS_PER_AUTHORITY,
+                )
+                .await
+                .unwrap(),
+            );
+        }
+        assert_eq!(global.available_permits(), 0);
+        drop(permits);
+        assert_eq!(global.available_permits(), 64);
     }
 }

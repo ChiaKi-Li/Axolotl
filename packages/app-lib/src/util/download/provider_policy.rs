@@ -38,8 +38,23 @@ pub(crate) fn modrinth_resource_urls(
     loader: Option<&str>,
     api_latency: Option<std::time::Duration>,
 ) -> Vec<String> {
-    let official_first =
-        api_latency.is_some_and(|latency| latency.as_millis() < 4000);
+    modrinth_resource_urls_with_mode(
+        urls,
+        game_version,
+        loader,
+        api_latency,
+        configured_modrinth_source_mode(),
+    )
+}
+
+fn modrinth_resource_urls_with_mode(
+    urls: &[String],
+    game_version: Option<&str>,
+    loader: Option<&str>,
+    api_latency: Option<std::time::Duration>,
+    source_mode: crate::state::DownloadSourceMode,
+) -> Vec<String> {
+    let official_first = modrinth_official_first(source_mode, api_latency);
     let mut output = Vec::new();
     for url in urls {
         let tracked = curseforge_candidate_urls(url);
@@ -83,8 +98,19 @@ pub(crate) fn modrinth_pack_urls(
     urls: &[String],
     api_latency: Option<std::time::Duration>,
 ) -> Vec<String> {
-    let official_first =
-        api_latency.is_some_and(|latency| latency.as_millis() < 4000);
+    modrinth_pack_urls_with_mode(
+        urls,
+        api_latency,
+        configured_modrinth_source_mode(),
+    )
+}
+
+fn modrinth_pack_urls_with_mode(
+    urls: &[String],
+    api_latency: Option<std::time::Duration>,
+    source_mode: crate::state::DownloadSourceMode,
+) -> Vec<String> {
+    let official_first = modrinth_official_first(source_mode, api_latency);
     let mut ordered = Vec::new();
     for url in urls {
         if let Some(mirror) = modrinth_mirror_url(url) {
@@ -98,6 +124,26 @@ pub(crate) fn modrinth_pack_urls(
         }
     }
     deduplicate(ordered)
+}
+
+fn configured_modrinth_source_mode() -> crate::state::DownloadSourceMode {
+    crate::State::get_if_initialized()
+        .map(|state| state.modrinth_source())
+        .unwrap_or_default()
+}
+
+fn modrinth_official_first(
+    source_mode: crate::state::DownloadSourceMode,
+    api_latency: Option<std::time::Duration>,
+) -> bool {
+    match source_mode {
+        crate::state::DownloadSourceMode::Auto => {
+            api_latency.is_some_and(|latency| latency.as_millis() < 4000)
+        }
+        crate::state::DownloadSourceMode::OfficialOnly
+        | crate::state::DownloadSourceMode::OfficialPreferred => true,
+        crate::state::DownloadSourceMode::MirrorPreferred => false,
+    }
 }
 
 pub(crate) fn exact_provider_route(
@@ -230,6 +276,32 @@ mod tests {
         assert!(urls[0].starts_with("https://cdn.modrinth.com/"));
         assert!(urls[1].starts_with("https://mod.tianpao.top/"));
         assert!(urls.iter().all(|url| !url.contains("mr_download_reason")));
+    }
+
+    #[test]
+    fn modrinth_source_modes_match_script_order_and_keep_mirror_fallbacks() {
+        let source =
+            ["https://cdn.modrinth.com/data/pack/version/pack.mrpack".into()];
+        let official = modrinth_pack_urls_with_mode(
+            &source,
+            None,
+            crate::state::DownloadSourceMode::OfficialPreferred,
+        );
+        let mirror = modrinth_pack_urls_with_mode(
+            &source,
+            None,
+            crate::state::DownloadSourceMode::MirrorPreferred,
+        );
+        let official_only = modrinth_pack_urls_with_mode(
+            &source,
+            None,
+            crate::state::DownloadSourceMode::OfficialOnly,
+        );
+
+        assert!(official[0].starts_with("https://cdn.modrinth.com/"));
+        assert!(mirror[0].starts_with("https://mod.tianpao.top/"));
+        assert!(official_only[0].starts_with("https://cdn.modrinth.com/"));
+        assert!(official_only[1].starts_with("https://mod.tianpao.top/"));
     }
 
     #[test]
