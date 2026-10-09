@@ -2959,6 +2959,7 @@ async fn fetch_advanced_inner(
                     }
                     record_route_failure(route, resource, None);
                     let error_message = err.to_string();
+                    let error_debug = format!("{err:?}");
                     let error: crate::Error = err.into();
                     let decision = if has_next_route {
                         "switch_route"
@@ -2988,6 +2989,7 @@ async fn fetch_advanced_inner(
                                 max_attempts,
                                 elapsed_ms = started.elapsed().as_millis(),
                                 error = %error_message,
+                                error_chain = %error_debug,
                                 "Modrinth mirror connection failed; falling back to official source"
                             );
                         } else {
@@ -3009,6 +3011,7 @@ async fn fetch_advanced_inner(
                                 max_attempts,
                                 elapsed_ms = started.elapsed().as_millis(),
                                 error = %error_message,
+                                error_chain = %error_debug,
                                 "Modrinth connection failed; retrying"
                             );
                         } else {
@@ -3016,6 +3019,7 @@ async fn fetch_advanced_inner(
                                 attempt,
                                 url = %log_request_url,
                                 error = %error_message,
+                                error_chain = %error_debug,
                                 "Fetch failed; retrying"
                             );
                         }

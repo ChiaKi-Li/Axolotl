@@ -92,7 +92,12 @@ pub(crate) fn download_error_category(error: &crate::Error) -> &'static str {
 pub(crate) fn download_error_detail(error: &crate::Error) -> String {
     match error.raw.as_ref() {
         ErrorKind::FetchError(source) => source.status().map_or_else(
-            || format!("{} failure", download_error_category(error)),
+            || {
+                bounded_diagnostic_text(
+                    format!("{}: {source:?}", download_error_category(error)),
+                    512,
+                )
+            },
             |status| format!("HTTP {}", status.as_u16()),
         ),
         ErrorKind::LabrinthError(error) => error.status.map_or_else(
