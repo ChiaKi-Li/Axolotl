@@ -296,6 +296,8 @@ struct ProviderDownloadBatchState {
     /// Remaining script-style global speed budget in bytes. Negative means
     /// the batch is uncapped (the script's default `speedLimitMiB: 0`).
     speed_limit_left: Mutex<f64>,
+    speed_limit_rate: Mutex<f64>,
+    speed_limit_updated_at: Mutex<Instant>,
 }
 
 impl std::fmt::Debug for ProviderDownloadBatch {
@@ -324,6 +326,8 @@ impl ProviderDownloadBatch {
                 failures_in_row: AtomicUsize::new(0),
                 failure_limit: AtomicUsize::new(8),
                 speed_limit_left: Mutex::new(-1.0),
+                speed_limit_rate: Mutex::new(0.0),
+                speed_limit_updated_at: Mutex::new(Instant::now()),
             }),
         }
     }
@@ -331,14 +335,16 @@ impl ProviderDownloadBatch {
     /// Applies the script's global speed budget to the batch. The budget is
     /// refilled by the scheduler tick, mirroring the script's 100ms refresh.
     pub(crate) fn set_speed_limit_mib(&self, limit_mib: f64) {
+        let mut rate = self.inner.speed_limit_rate.lock();
         let mut left = self.inner.speed_limit_left.lock();
         if limit_mib > 0.0 {
-            if *left < 0.0 {
-                *left = 0.0;
-            }
+            *left = 0.0;
+            *rate = limit_mib * 1024.0 * 1024.0;
         } else {
             *left = -1.0;
+            *rate = 0.0;
         }
+        *self.inner.speed_limit_updated_at.lock() = Instant::now();
     }
 
     fn refill_speed_limit(&self, limit_bytes_per_second: f64) {
@@ -347,22 +353,26 @@ impl ProviderDownloadBatch {
         }
         let mut left = self.inner.speed_limit_left.lock();
         if *left >= 0.0 {
-            *left += limit_bytes_per_second / 10.0;
+            let mut updated_at = self.inner.speed_limit_updated_at.lock();
+            let elapsed = updated_at.elapsed().as_secs_f64();
+            *left += limit_bytes_per_second * elapsed;
+            *updated_at = Instant::now();
         }
     }
 
     async fn consume_speed_budget(&self, bytes: u64) {
         loop {
-            let limited = {
+            let rate = *self.inner.speed_limit_rate.lock();
+            self.refill_speed_limit(rate);
+            {
                 let mut left = self.inner.speed_limit_left.lock();
                 if *left < 0.0 {
                     return;
                 }
-                *left -= bytes as f64;
-                *left <= 0.0
-            };
-            if !limited {
-                return;
+                if *left >= bytes as f64 {
+                    *left -= bytes as f64;
+                    return;
+                }
             }
             tokio::time::sleep(time::Duration::from_millis(16)).await;
         }
@@ -3138,8 +3148,12 @@ async fn preserve_or_remove_partial(
     routes_can_resume: bool,
     provider_script_policy: bool,
 ) -> crate::Result<()> {
+    if provider_script_policy {
+        remove_if_exists(part_path).await?;
+        return Ok(());
+    }
     let resumable = routes_can_resume
-        && (integrity.supports_resume() || provider_script_policy)
+        && integrity.supports_resume()
         && tokio::fs::metadata(part_path)
             .await
             .is_ok_and(|metadata| metadata.len() > 0);
@@ -4846,6 +4860,19 @@ async fn download_segment_once(
         let parsed_content_range = parse_content_range(&response);
         tracing::debug!(
             path = %part_path.display(),
+            source = route.source.as_str(),
+            url = %sanitize_url_for_log(&route.url),
+            attempt,
+            range_start = requested_start,
+            range_end = requested_end,
+            status = response.status().as_u16(),
+            content_length = response.content_length(),
+            content_range = ?parsed_content_range,
+            ttfb_ms = request_started.elapsed().as_millis(),
+            "provider range response received"
+        );
+        tracing::debug!(
+            path = %part_path.display(),
             original_url = %sanitize_url_for_log(&route.url),
             final_host = Url::parse(&final_url)
                 .ok()
@@ -4898,6 +4925,14 @@ async fn download_segment_once(
         {
             let actual_size =
                 content_length.expect("known provider initial size");
+            tracing::debug!(
+                path = %part_path.display(),
+                source = route.source.as_str(),
+                actual_size,
+                manifest_size = total_size,
+                checked = provider_check_initial_size,
+                "provider initial response size established"
+            );
             if actual_size == 0 {
                 return_segment_error!(SegmentDownloadError::Protocol(
                     "provider initial response size is zero",
@@ -5339,21 +5374,29 @@ async fn download_segment(
 ) -> Result<SegmentDownloadCompletion, SegmentDownloadError> {
     if provider_script_policy {
         if cancellation.is_some_and(|token| token.is_cancelled()) {
+            tracing::debug!(url = %sanitize_url_for_log(&route.url), "provider range canceled before request");
             return Err(SegmentDownloadError::Transport);
         }
         if provider_sources
             .as_ref()
             .is_some_and(|sources| sources.lock().is_disabled(route))
         {
+            tracing::debug!(
+                source = route.source.as_str(),
+                url = %sanitize_url_for_log(&route.url),
+                "provider source skipped because it is disabled"
+            );
             return Err(SegmentDownloadError::Transport);
         }
         let batch = provider_sources
             .as_ref()
             .and_then(|sources| sources.lock().batch.clone());
         let Some(batch) = batch else {
+            tracing::debug!(url = %sanitize_url_for_log(&route.url), "provider range missing shared batch");
             return Err(SegmentDownloadError::Transport);
         };
         if !wait_provider_launch(&batch, route, cancellation).await {
+            tracing::debug!(url = %sanitize_url_for_log(&route.url), "provider range canceled while waiting for launch slot");
             return Err(SegmentDownloadError::Transport);
         }
     }
@@ -5361,6 +5404,13 @@ async fn download_segment(
         .as_ref()
         .map(|sources| sources.lock().timeout_for(route))
         .unwrap_or(request_timeout);
+    tracing::debug!(
+        source = route.source.as_str(),
+        url = %sanitize_url_for_log(&route.url),
+        timeout_ms = candidate_timeout.as_millis(),
+        expected_size = total_size,
+        "starting provider range request"
+    );
     let result = download_segment_once(
         route,
         range,
@@ -5391,6 +5441,12 @@ async fn download_segment(
     .await;
     if provider_script_policy {
         if let Err(error) = &result {
+            tracing::debug!(
+                source = route.source.as_str(),
+                url = %sanitize_url_for_log(&route.url),
+                error = ?error,
+                "provider range request failed"
+            );
             if let Some(provider_sources) = provider_sources.as_ref() {
                 let (status, message, protocol_fatal) = match error {
                     SegmentDownloadError::Protocol(reason) => (
@@ -5461,6 +5517,13 @@ async fn finalize_segmented_output(
 ) -> SegmentedDownloadOutcome {
     record_install_download_stage(request, DownloadItemStatus::Writing).await;
     if downloaded != size {
+        tracing::debug!(
+            path = %part_path.display(),
+            source = route.source.as_str(),
+            downloaded,
+            expected = size,
+            "segmented download byte count mismatch"
+        );
         let _ = remove_if_exists(part_path).await;
         return SegmentedDownloadOutcome::FallbackSingle {
             disable_range: true,
@@ -5500,6 +5563,14 @@ async fn finalize_segmented_output(
     }
     record_range_splitting_success(route);
     cleanup_guard.disarm();
+    tracing::debug!(
+        path = %part_path.display(),
+        source = route.source.as_str(),
+        bytes = size,
+        ranges = downloaded,
+        elapsed_ms = transfer_started.elapsed().as_millis(),
+        "segmented download verified successfully"
+    );
     SegmentedDownloadOutcome::Success(SegmentedDownloadSuccess {
         size,
         final_url: final_url.unwrap_or_else(|| route.url.clone()),
@@ -5913,18 +5984,15 @@ async fn try_segmented_download(
             }
             _ = scheduler.tick() => {
                 if request.provider_script_policy {
-                    if let Some(batch) = provider_batch.as_ref()
-                        && request.provider_speed_limit_mib > 0.0
-                    {
-                        batch.refill_speed_limit(
-                            request.provider_speed_limit_mib
-                                * 1024.0
-                                * 1024.0,
-                        );
-                    }
                     if let Some((retry_range, retry_index)) =
                         retry_queue.pop_front()
                     {
+                        tracing::debug!(
+                            source_index = retry_index,
+                            range_start = retry_range.start,
+                            range_end = retry_range.end(),
+                            "retrying provider range on next source"
+                        );
                         if let Some(permit) = try_acquire_native_connection_with_policy(
                             &provider_routes[retry_index],
                             semaphore,
@@ -6033,6 +6101,14 @@ async fn try_segmented_download(
                     {
                         next_range_index += 1;
                         let work_range = new_range.clone();
+                        tracing::debug!(
+                            source = split_route.source.as_str(),
+                            url = %sanitize_url_for_log(&split_route.url),
+                            range_start = new_range.start,
+                            range_end = new_range.end(),
+                            active_ranges,
+                            "starting provider dynamic range split"
+                        );
                         downloads.push(download_segment(
                             split_route,
                             new_range.clone(),
@@ -6422,6 +6498,17 @@ pub async fn download_to_path(
     let request_url = request.url.clone();
     let destination_path = destination.as_ref();
     let integrity = request.integrity.clone();
+    tracing::debug!(
+        url = %sanitize_url_for_log(&request_url),
+        destination = %destination_path.display(),
+        resource = ?request.resource,
+        provider_policy = request.provider_script_policy,
+        expected_size = ?request.integrity.size,
+        has_sha1 = request.integrity.sha1.is_some(),
+        has_sha512 = request.integrity.sha512.is_some(),
+        candidate_count = request.candidate_urls.len() + 1,
+        "download requested"
+    );
     let result = super::download::proxy_context::with_clients(
         crate::util::single_flight::run(destination_path, &integrity, || {
             download_to_path_inner(
@@ -6469,7 +6556,7 @@ fn build_download_routes(
     urls.extend(request.candidate_urls.iter().cloned());
     if request.preserve_candidate_order || request.provider_script_policy {
         let mut seen = HashSet::new();
-        return urls
+        let routes = urls
             .into_iter()
             .map(|url| {
                 super::download::provider_policy::normalize_provider_url(&url)
@@ -6481,7 +6568,16 @@ fn build_download_routes(
                     request.resource,
                 )
             })
-            .collect();
+            .collect::<Vec<_>>();
+        tracing::debug!(
+            resource = ?request.resource,
+            provider_policy = request.provider_script_policy,
+            routes = ?routes.iter().map(|route| {
+                (sanitize_url_for_log(&route.url), route.source.as_str(), route.is_mirror, route.supports_range, route.proxy)
+            }).collect::<Vec<_>>(),
+            "provider download routes normalized"
+        );
+        return routes;
     }
     let mut routes = Vec::new();
     for (index, url) in urls.into_iter().enumerate() {
@@ -6826,12 +6922,27 @@ async fn download_to_path_inner(
     );
     let mode = source_mode_for_resource(request.resource);
     let mut routes = build_download_routes(&request, mode);
+    tracing::debug!(
+        destination = %destination.display(),
+        resource = ?request.resource,
+        source_mode = ?mode,
+        route_count = routes.len(),
+        routes = ?routes.iter().map(|route| {
+            (sanitize_url_for_log(&route.url), route.source.as_str(), route.is_mirror, route.supports_range, route.proxy)
+        }).collect::<Vec<_>>(),
+        "download routes selected"
+    );
     let part_path = suffixed_path(destination, ".part");
 
     if let Some(result) =
         reuse_existing_download(&request, &routes, destination, &part_path)
             .await?
     {
+        tracing::debug!(
+            destination = %destination.display(),
+            bytes = result.size,
+            "download satisfied by existing verified file"
+        );
         return Ok(attach_verified_integrity(result, &request.integrity).await);
     }
     if let Some(result) = resume_checkpointed_download(
@@ -6843,6 +6954,11 @@ async fn download_to_path_inner(
     )
     .await?
     {
+        tracing::debug!(
+            destination = %destination.display(),
+            bytes = result.size,
+            "download resumed from checkpoint"
+        );
         return Ok(result);
     }
     prepare_partial_download(
@@ -6860,6 +6976,12 @@ async fn download_to_path_inner(
     let h2_failed_nonofficial = if let Some((h2_route, h2_policy)) =
         select_h2_download_route(&request, &routes, &part_path).await
     {
+        tracing::debug!(
+            destination = %destination.display(),
+            source = h2_route.source.as_str(),
+            url = %sanitize_url_for_log(&h2_route.url),
+            "attempting HTTP/2 download path"
+        );
         match try_h2_download(
             &request,
             h2_route,
@@ -6871,6 +6993,13 @@ async fn download_to_path_inner(
         .await?
         {
             H2AttemptResult::Completed(result) => {
+                tracing::debug!(
+                    destination = %destination.display(),
+                    source = result.source.as_str(),
+                    bytes = result.size,
+                    attempts = result.attempts,
+                    "HTTP/2 download completed"
+                );
                 return Ok(attach_verified_integrity(
                     result,
                     &request.integrity,
@@ -7376,6 +7505,13 @@ async fn run_native_download_attempts(
 ) -> crate::Result<DownloadResult> {
     let credentials: Option<crate::state::ModrinthCredentials> = None;
     let provider_batch = request.provider_batch.clone();
+    tracing::debug!(
+        destination = %destination.display(),
+        provider_policy = request.provider_script_policy,
+        route_count = routes.len(),
+        concurrency = configured_semaphore_limit(semaphore),
+        "starting native download attempts"
+    );
     if request.provider_script_policy {
         provider_batch
             .as_ref()
@@ -7392,6 +7528,10 @@ async fn run_native_download_attempts(
     );
     if request.provider_script_policy {
         session.file_attempt_budget = usize::MAX;
+        tracing::debug!(
+            route_count = routes.len(),
+            "provider download uses unbounded retry budget with bounded source policy"
+        );
     }
     if let Some(failed_route) = h2_failed_nonofficial.take() {
         routes.retain(|route| route.url != failed_route);
@@ -7421,16 +7561,14 @@ async fn run_native_download_attempts(
             cleanup_segment_files(&part_path, MAX_SEGMENT_CONCURRENCY).await?;
             session.partial_route_index = None;
         }
-        let fallback_route_index = if request.provider_script_policy
-            && retry_with_single_thread
-        {
-            routes.iter().position(|route| {
-                !session.provider_source_is_disabled(route)
-                    && !session.provider_fallback_attempted.contains(&route.url)
-            })
-        } else {
-            None
-        };
+        let fallback_route_index =
+            if request.provider_script_policy && retry_with_single_thread {
+                routes.iter().position(|route| {
+                    !session.provider_fallback_attempted.contains(&route.url)
+                })
+            } else {
+                None
+            };
         if request.provider_script_policy
             && retry_with_single_thread
             && fallback_route_index.is_none()
@@ -7451,6 +7589,7 @@ async fn run_native_download_attempts(
                 break;
             }
             if request.provider_script_policy
+                && !retry_with_single_thread
                 && session.provider_source_is_disabled(route)
             {
                 continue;
@@ -7526,6 +7665,16 @@ async fn run_native_download_attempts(
                 retry_with_single_thread,
             )
             .await?;
+            tracing::debug!(
+                destination = %destination.display(),
+                route_index,
+                source = route.source.as_str(),
+                url = %sanitize_url_for_log(&route.url),
+                attempt_count = session.attempts.saturating_sub(attempts_before_route),
+                single_thread = retry_with_single_thread,
+                terminal = session.terminal_routes.contains(&route.url),
+                "provider route attempt finished"
+            );
             if request.provider_script_policy
                 && retry_with_single_thread
                 && session.attempts > attempts_before_route
@@ -7574,18 +7723,17 @@ async fn run_native_download_attempts(
                 .iter()
                 .any(|route| !session.provider_source_is_disabled(route));
             if !normal_source_available {
+                tracing::debug!(
+                    source_count = routes.len(),
+                    "all normal provider sources failed; entering SourcesOnce fallback"
+                );
                 session.begin_provider_single_thread_fallback(&routes);
             }
         }
-        if request.provider_script_policy
-            && retry_with_single_thread
-            && session
-                .provider_sources
-                .lock()
-                .all_sources_disabled(&routes)
-        {
-            break;
-        }
+        // SourcesOnce is a bounded pass over every original source. A source
+        // that was disabled during the parallel phase is still eligible for
+        // this one final single-thread attempt, matching the script's
+        // `onceSources` fallback.
         if request.provider_script_policy
             || routes
                 .iter()
@@ -8592,6 +8740,16 @@ async fn run_native_route_attempts(
         }
 
         if let Some(error) = transfer_error {
+            tracing::debug!(
+                path = %destination.display(),
+                source = route.source.as_str(),
+                url = %log_url,
+                attempt = session.attempts,
+                downloaded,
+                expected = ?provider_transfer_size,
+                error = %error,
+                "download body transfer failed"
+            );
             record_route_failure(route, request.resource, None);
             record_native_transfer_failure(route, None);
             preserve_or_remove_partial(
@@ -8627,6 +8785,13 @@ async fn run_native_route_attempts(
         if let Some(expected_transfer_size) = provider_transfer_size.flatten()
             && downloaded < expected_transfer_size
         {
+            tracing::debug!(
+                path = %destination.display(),
+                source = route.source.as_str(),
+                downloaded,
+                expected = expected_transfer_size,
+                "provider response ended before expected size"
+            );
             let error: crate::Error = ErrorKind::OtherError(format!(
                 "Truncated provider response from {log_url}: received {downloaded} of {expected_transfer_size} bytes"
             ))
@@ -8709,11 +8874,28 @@ async fn run_native_route_attempts(
         record_install_download_stage(request, DownloadItemStatus::Verifying)
             .await;
         let computed = hashers.finish(downloaded);
+        tracing::debug!(
+            path = %destination.display(),
+            source = route.source.as_str(),
+            downloaded,
+            computed_size = computed.size,
+            expected_size = ?request.integrity.size,
+            "download body received; verifying integrity"
+        );
         if let Err(error) = verify_computed_integrity_with_size_policy(
             &request.integrity,
             &computed,
             request.provider_script_policy,
         ) {
+            tracing::debug!(
+                path = %destination.display(),
+                source = route.source.as_str(),
+                url = %log_url,
+                downloaded,
+                error = %error,
+                single_thread = retry_with_single_thread,
+                "download integrity verification failed"
+            );
             record_route_failure(route, request.resource, None);
             if http_version == reqwest::Version::HTTP_2
                 && let Some(authority) = url_authority(&route.url)
