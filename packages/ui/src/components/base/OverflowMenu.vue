@@ -7,6 +7,7 @@
         :dropdown-id="dropdownId"
         :tooltip="tooltip"
         :placement="placement"
+        menu
     >
         <slot></slot>
         <template #menu>
@@ -15,45 +16,55 @@
                 v-for="(option, index) in options.filter((x) => x.shown === undefined || x.shown)"
                 :key="isDivider(option) ? `divider-${index}` : `option-${option.id}`"
             >
-                <div v-if="isDivider(option)" class="h-px mx-[0.625rem] my-2 bg-surface-5"></div>
-                <ButtonLink
-                    v-else-if="option.link"
-                    v-tooltip="option.tooltip"
-                    :as="isInternalLink(option.link) ? RouterLink : 'a'"
-                    :to="isInternalLink(option.link) ? option.link : undefined"
-                    :href="isInternalLink(option.link) ? undefined : option.link"
-                    type="quiet"
-                    :color="normalizedColor(option.color)"
-                    :interaction="normalizedInteraction(option)"
-                    :download="option.download || undefined"
-                    :target="option.external ? '_blank' : '_self'"
-                    :disabled="option.disabled"
-                    :class="optionClasses(option)"
-                    @click="handleLinkClick(option, $event)"
-                >
-                    <template v-if="!$slots[option.id]">
-                        <component :is="option.icon" v-if="option.icon" class="size-5" />
-                        {{ option.id }}
-                    </template>
-                    <slot :name="option.id"></slot>
-                    <ExternalIcon v-if="option.external" class="!size-3" />
-                </ButtonLink>
-                <Button
+                <DropdownMenuSeparator
+                    v-if="isDivider(option)"
+                    class="h-px mx-[0.625rem] my-2 bg-surface-5"
+                />
+                <DropdownMenuItem
                     v-else
-                    v-tooltip="option.tooltip"
-                    type="quiet"
-                    :color="normalizedColor(option.color)"
-                    :interaction="normalizedInteraction(option)"
+                    as-child
                     :disabled="option.disabled"
-                    :class="optionClasses(option)"
-                    @click="option.action ? handleActionClick(option, $event) : undefined"
+                    @select="option.remainOnClick ? $event.preventDefault() : undefined"
                 >
-                    <template v-if="!$slots[option.id]">
-                        <component :is="option.icon" v-if="option.icon" class="size-5" />
-                        {{ option.id }}
-                    </template>
-                    <slot :name="option.id"></slot>
-                </Button>
+                    <ButtonLink
+                        v-if="option.link"
+                        v-tooltip="option.tooltip"
+                        :as="isInternalLink(option.link) ? RouterLink : 'a'"
+                        :to="isInternalLink(option.link) ? option.link : undefined"
+                        :href="isInternalLink(option.link) ? undefined : option.link"
+                        type="quiet"
+                        :color="normalizedColor(option.color)"
+                        :interaction="normalizedInteraction(option)"
+                        :download="option.download || undefined"
+                        :target="option.external ? '_blank' : '_self'"
+                        :disabled="option.disabled"
+                        :class="optionClasses(option)"
+                        @click="option.action?.($event)"
+                    >
+                        <template v-if="!$slots[option.id]">
+                            <component :is="option.icon" v-if="option.icon" class="size-5" />
+                            {{ option.id }}
+                        </template>
+                        <slot :name="option.id"></slot>
+                        <ExternalIcon v-if="option.external" class="!size-3" />
+                    </ButtonLink>
+                    <Button
+                        v-else
+                        v-tooltip="option.tooltip"
+                        type="quiet"
+                        :color="normalizedColor(option.color)"
+                        :interaction="normalizedInteraction(option)"
+                        :disabled="option.disabled"
+                        :class="optionClasses(option)"
+                        @click="option.action?.($event)"
+                    >
+                        <template v-if="!$slots[option.id]">
+                            <component :is="option.icon" v-if="option.icon" class="size-5" />
+                            {{ option.id }}
+                        </template>
+                        <slot :name="option.id"></slot>
+                    </Button>
+                </DropdownMenuItem>
             </template>
         </template>
     </PopoutMenu>
@@ -61,6 +72,7 @@
 
 <script setup lang="ts">
 import ExternalIcon from '@modrinth/assets/icons/external.svg?component'
+import { DropdownMenuItem, DropdownMenuSeparator } from 'reka-ui'
 import { type Component, type Ref, ref } from 'vue'
 import { RouterLink } from 'vue-router'
 
@@ -178,16 +190,6 @@ function optionClasses(option: Item): string[] {
             ? '[&:not(:hover):not(:focus-visible)]:!text-[var(--color-text-default)]'
             : '',
     ]
-}
-
-function handleActionClick(option: Item, event: MouseEvent) {
-    option.action?.(event)
-    if (!option.remainOnClick) close()
-}
-
-function handleLinkClick(option: Item, event: MouseEvent) {
-    option.action?.(event)
-    if (!option.remainOnClick) close()
 }
 
 defineExpose({ open, close })

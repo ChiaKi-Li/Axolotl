@@ -1,32 +1,38 @@
 <template>
-    <DropdownMenuRoot v-model:open="open" :modal="false">
-        <DropdownMenuTrigger
+    <component :is="menu ? DropdownMenuRoot : PopoverRoot" v-model:open="open" :modal="false">
+        <component
+            :is="menu ? DropdownMenuTrigger : PopoverTrigger"
             as-child
             @keydown="noteTriggerKeydown"
             @pointerdown="noteTriggerPointerdown"
         >
             <slot name="trigger">
-                <button ref="trigger" v-bind="$attrs" v-tooltip="tooltip">
+                <button v-tooltip="tooltip" v-bind="$attrs">
                     <slot></slot>
                 </button>
             </slot>
-        </DropdownMenuTrigger>
+        </component>
 
-        <DropdownMenuPortal :to="portalTarget">
-            <DropdownMenuContent
+        <component :is="menu ? DropdownMenuPortal : PopoverPortal" :to="portalTarget">
+            <component
+                :is="menu ? DropdownMenuContent : PopoverContent"
                 :id="dropdownId || undefined"
-                ref="content"
                 :side="side"
                 :align="align"
                 :side-offset="sideOffset"
                 :class="[dropdownClass, 'menu-surface']"
-                @open-auto-focus="focusFirstContent"
+                @open-auto-focus="preventPointerFocus"
             >
                 <slot name="menu" :hide="hide"></slot>
-                <DropdownMenuArrow class="menu-arrow" :width="14" :height="7" />
-            </DropdownMenuContent>
-        </DropdownMenuPortal>
-    </DropdownMenuRoot>
+                <component
+                    :is="menu ? DropdownMenuArrow : PopoverArrow"
+                    class="menu-arrow"
+                    :width="14"
+                    :height="7"
+                />
+            </component>
+        </component>
+    </component>
 </template>
 
 <script setup lang="ts">
@@ -41,8 +47,13 @@ import {
     DropdownMenuPortal,
     DropdownMenuRoot,
     DropdownMenuTrigger,
+    PopoverArrow,
+    PopoverContent,
+    PopoverPortal,
+    PopoverRoot,
+    PopoverTrigger,
 } from 'reka-ui'
-import { type ComponentPublicInstance, computed, ref } from 'vue'
+import { computed } from 'vue'
 
 const props = withDefaults(
     defineProps<{
@@ -52,6 +63,8 @@ const props = withDefaults(
         tooltip?: string
         placement?: string
         container?: string | HTMLElement | boolean
+        /** Registered menu items use DropdownMenu; arbitrary panels use Popover. */
+        menu?: boolean
     }>(),
     {
         dropdownId: undefined,
@@ -60,6 +73,7 @@ const props = withDefaults(
         tooltip: undefined,
         placement: 'bottom-end',
         container: undefined,
+        menu: false,
     },
 )
 
@@ -68,8 +82,6 @@ defineOptions({
 })
 
 const open = defineModel<boolean>('open', { default: false })
-const trigger = ref<HTMLElement>()
-const content = ref<ComponentPublicInstance>()
 
 // A pointer open must not move focus: clicking a menu would otherwise pull the
 // caret out of whatever the user was editing and drop a focus ring on the first
@@ -79,24 +91,22 @@ let openedFromKeyboard = false
 
 function noteTriggerKeydown(event: KeyboardEvent) {
     openedFromKeyboard = ['ArrowDown', 'ArrowUp', 'Enter', ' '].includes(event.key)
+    if (!props.menu && ['ArrowDown', 'ArrowUp'].includes(event.key)) {
+        event.preventDefault()
+        open.value = true
+    }
 }
 
 function noteTriggerPointerdown() {
     openedFromKeyboard = false
 }
 
-function focusFirstContent(event: Event) {
+function preventPointerFocus(event: Event) {
     if (!openedFromKeyboard) {
         // Leave focus where the user left it; reka would otherwise focus the
         // content itself on a pointer open.
         event.preventDefault()
-        return
     }
-    event.preventDefault()
-    const root = content.value?.$el as HTMLElement | undefined
-    root?.querySelector<HTMLElement>(
-        'button:not(:disabled), a[href], [tabindex]:not([tabindex="-1"])',
-    )?.focus()
 }
 
 /**
@@ -136,7 +146,6 @@ function show() {
 
 function hide() {
     open.value = false
-    trigger.value?.focus()
 }
 
 defineExpose({ show, hide })
