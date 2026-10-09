@@ -821,9 +821,12 @@ function handleTriggerKeydown(event: KeyboardEvent) {
 }
 
 function handleDropdownKeydown(event: KeyboardEvent) {
+    if (event.defaultPrevented) return
     switch (event.key) {
         case 'Escape':
             event.preventDefault()
+            event.stopPropagation()
+            if (props.searchable) searchTriggerRef.value?.focus()
             closeDropdown()
             break
         case 'ArrowDown':
@@ -856,8 +859,9 @@ function handleDropdownKeydown(event: KeyboardEvent) {
 }
 
 function handleSearchKeydown(event: KeyboardEvent) {
-    if (event.key === 'Escape') {
+    if (event.key === 'Escape' && isOpen.value) {
         event.preventDefault()
+        event.stopPropagation()
         closeDropdown()
     } else if (event.key === 'ArrowDown') {
         event.preventDefault()

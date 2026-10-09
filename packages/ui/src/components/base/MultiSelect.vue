@@ -508,7 +508,7 @@
                         </div>
                     </template>
 
-                    <div v-if="$slots.bottom" @keydown.stop>
+                    <div v-if="$slots.bottom" @keydown="handleSearchActionsKeydown">
                         <slot name="bottom"></slot>
                     </div>
 
@@ -1418,9 +1418,11 @@ function getOptionWrapperStyle(index: number) {
 }
 
 function handleDropdownKeydown(event: KeyboardEvent) {
+    if (event.defaultPrevented) return
     switch (event.key) {
         case 'Escape':
             event.preventDefault()
+            event.stopPropagation()
             closeDropdown()
             break
         case 'ArrowDown':

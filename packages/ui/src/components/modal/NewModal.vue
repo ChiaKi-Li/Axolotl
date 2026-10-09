@@ -363,8 +363,10 @@ onUnmounted(() => {
 })
 
 function handleWindowKeyDown(event: KeyboardEvent) {
+    if (event.defaultPrevented) return
     if (props.closeOnEsc && event.key === 'Escape' && props.closable) {
-        if (!isTopmostModal()) return
+        if (!isTopmostModal() || props.disableClose) return
+        event.preventDefault()
         hide()
     }
 }
