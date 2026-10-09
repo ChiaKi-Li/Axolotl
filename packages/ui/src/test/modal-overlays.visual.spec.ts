@@ -1,4 +1,4 @@
-import { afterEach, expect, it } from 'vitest'
+import { afterEach, expect, it, vi } from 'vitest'
 import { defineComponent, effectScope, h, nextTick, ref } from 'vue'
 
 import Combobox from '../components/base/Combobox.vue'
@@ -17,12 +17,12 @@ afterEach(() =>
         .forEach((fn) => fn()),
 )
 
-async function modal(child: ReturnType<typeof h>) {
+async function modal(child: ReturnType<typeof h>, props: Record<string, unknown> = {}) {
     const teleports = document.createElement('div')
     teleports.id = 'teleports'
     document.body.append(teleports)
     cleanup.push(() => teleports.remove())
-    const wrapper = await mountThemed(NewModal, { header: 'Export logs' }, 'dark', {
+    const wrapper = await mountThemed(NewModal, { header: 'Export logs', ...props }, 'dark', {
         slots: { default: () => child },
         global: {
             provide: {
@@ -246,4 +246,81 @@ it('restores independent overflow axes and their priorities', () => {
     expect(document.body.style.overflowY).toBe('auto')
     expect(document.body.style.getPropertyPriority('overflow-x')).toBe('important')
     expect(document.body.style.getPropertyPriority('overflow-y')).toBe('')
+})
+
+it('keeps a reopened modal visible, focused and locked after the old close deadline', async () => {
+    const afterHide = vi.fn()
+    const { vm } = await modal(h('input'), { onAfterHide: afterHide })
+    const oldClose = vm.hide()
+    vm.show()
+    await oldClose
+    await waitFor(() => !!document.querySelector('.modal-container.shown'))
+    await new Promise((resolve) => setTimeout(resolve, 350))
+    expect(document.querySelector('[role="dialog"]')).not.toBeNull()
+    expect(document.body.style.overflow).toBe('hidden')
+    expect(document.querySelector('.modal-body')?.contains(document.activeElement)).toBe(true)
+    expect(afterHide).not.toHaveBeenCalled()
+    await vm.hide()
+    expect(document.querySelector('[role="dialog"]')).toBeNull()
+    expect(document.body.style.overflow).toBe('')
+    expect(afterHide).toHaveBeenCalledOnce()
+})
+
+it('cancels an opening timer when immediately hidden and only completes one close', async () => {
+    const onHide = vi.fn()
+    const afterHide = vi.fn()
+    const { vm } = await modal(h('input'), { onHide, onAfterHide: afterHide })
+    await vm.hide()
+    onHide.mockClear()
+    afterHide.mockClear()
+    vm.show()
+    const closing = vm.hide()
+    await vm.hide()
+    await new Promise((resolve) => setTimeout(resolve, 80))
+    expect(document.querySelector('.modal-container.shown')).toBeNull()
+    expect(onHide).toHaveBeenCalledOnce()
+    await closing
+    expect(afterHide).toHaveBeenCalledOnce()
+    expect(document.querySelector('[role="dialog"]')).toBeNull()
+})
+
+it('cleans up delayed opening and closing work on unmount', async () => {
+    const afterHide = vi.fn()
+    const { wrapper, vm } = await modal(h('input'), { onAfterHide: afterHide })
+    const close = vm.hide()
+    wrapper.unmount()
+    await close
+    vm.show()
+    await new Promise((resolve) => setTimeout(resolve, 350))
+    expect(afterHide).not.toHaveBeenCalled()
+    expect(document.querySelector('[role="dialog"]')).toBeNull()
+    expect(document.body.style.overflow).toBe('')
+})
+
+it('can reopen from onHide without inheriting a pending close', async () => {
+    const afterHide = vi.fn()
+    const mounted = await modal(h('input'), {
+        onHide: () => vm.show(),
+        onAfterHide: afterHide,
+    })
+    const vm = mounted.vm
+    await vm.hide()
+    await new Promise((resolve) => setTimeout(resolve, 350))
+    expect(document.querySelector('.modal-container.shown')).not.toBeNull()
+    expect(document.body.style.overflow).toBe('hidden')
+    expect(afterHide).not.toHaveBeenCalled()
+})
+
+it('does not run opening callbacks after the component unmounts', async () => {
+    const { vm, wrapper } = await modal(h('input'))
+    await vm.hide()
+    vm.show()
+    wrapper.unmount()
+    await new Promise((resolve) => setTimeout(resolve, 80))
+    expect(document.querySelector('[role="dialog"]')).toBeNull()
+    expect(document.body.style.overflow).toBe('')
+    const next = await modal(h('input'))
+    expect(document.body.style.overflow).toBe('hidden')
+    await next.vm.hide()
+    expect(document.body.style.overflow).toBe('')
 })
