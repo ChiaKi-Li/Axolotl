@@ -1018,6 +1018,7 @@ const pendingContentChanges = computed(() =>
 const isBulkOperating = localBulkOperating
 const isInstanceBusy = computed(() => props.instance?.install_stage !== 'installed')
 let contentRequestGeneration = 0
+let activeBypassRefresh: Promise<void> | null = null
 
 function isCurrentContentRequest(instanceId: string, generation: number) {
     return (
@@ -2609,7 +2610,21 @@ function openSchematicInWorkshop(item: ContentItem) {
     })
 }
 
-async function initProjects(cacheBehaviour?: CacheBehaviour) {
+async function initProjects(cacheBehaviour?: CacheBehaviour): Promise<void> {
+    if (cacheBehaviour === 'bypass') {
+        if (activeBypassRefresh) return activeBypassRefresh
+        const refresh = initProjectsInternal(cacheBehaviour)
+        const wrappedRefresh = refresh.finally(() => {
+            if (activeBypassRefresh === wrappedRefresh) activeBypassRefresh = null
+            suppressSyncedUntil = Date.now() + 1000
+        })
+        activeBypassRefresh = wrappedRefresh
+        return wrappedRefresh
+    }
+    return initProjectsInternal(cacheBehaviour)
+}
+
+async function initProjectsInternal(cacheBehaviour?: CacheBehaviour) {
     void loadWorldDatapacks()
     if (!props.instance || props.instance.install_stage !== 'installed') {
         invalidateContentRequests(true)

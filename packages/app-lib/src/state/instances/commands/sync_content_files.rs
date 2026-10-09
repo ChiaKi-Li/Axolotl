@@ -71,8 +71,14 @@ pub(crate) async fn sync_instance_content_files(
     instance: &Instance,
     state: &State,
 ) -> crate::Result<Vec<InstanceFile>> {
-    // Keep the filesystem snapshot stable until its database rows commit.
-    let _instance_lock = state.lock_instance_content(&instance.id).await;
+    let watch_snapshot = state
+        .file_watcher
+        .content_watch_snapshot(&instance.id)
+        .await;
+    let dirty_paths = watch_snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.dirty_paths.clone())
+        .unwrap_or_default();
     let content_root = instance_content_root(&state.directories, instance)?;
     // The hash-cache layer resolves key paths against Axolotl's own instances
     // folder (`state/cache.rs`). For directly associated instances the
@@ -167,16 +173,29 @@ pub(crate) async fn sync_instance_content_files(
     for file in scanned {
         let hash_key = file.hash_cache_key.trim_end_matches(".disabled");
         let existing_file = existing_files_by_path.get(&file.relative_path);
-        let (scanned_sha1, scanned_size) = if existing_file.is_some() {
+        let (scanned_sha1, scanned_size) = if let Some(existing_file) =
+            existing_file
+            && existing_file.size == file.size
+            && !content_path_is_dirty(&file.relative_path, &dirty_paths)
+        {
+            (existing_file.sha1.clone(), file.size)
+        } else if existing_file.is_some() {
             let path =
                 join_content_path(&instance_files_root, &file.relative_path);
             let (_, sha1) = fetch::sha1_file_async(&path).await?;
             (sha1, file.size)
         } else {
-            let Some(hash) = hashes_by_key.get(hash_key) else {
-                continue;
-            };
-            (hash.hash.clone(), hash.size)
+            match hashes_by_key.get(hash_key) {
+                Some(hash) => (hash.hash.clone(), hash.size),
+                None => {
+                    let path = join_content_path(
+                        &instance_files_root,
+                        &file.relative_path,
+                    );
+                    let (_, sha1) = fetch::sha1_file_async(&path).await?;
+                    (sha1, file.size)
+                }
+            }
         };
         let reclaim_candidate = if existing_file.is_some() {
             None
@@ -327,6 +346,10 @@ pub(crate) async fn sync_instance_content_files(
         }
     }
 
+    // Hashing is deliberately outside the instance lock. The lock only
+    // protects the short database reconciliation transaction, so a large
+    // modpack cannot block disable/delete operations for its entire scan.
+    let _instance_lock = state.lock_instance_content(&instance.id).await;
     let mut tx = state.pool.begin_with("BEGIN IMMEDIATE").await?;
     sqlite::content_rows::ensure_instance_exists(&instance.id, &mut tx).await?;
     sqlite::content_rows::mark_instance_files_missing(&instance.id, &mut tx)
@@ -400,7 +423,26 @@ pub(crate) async fn sync_instance_content_files(
 
     tx.commit().await?;
 
+    if let Some(snapshot) = watch_snapshot {
+        state
+            .file_watcher
+            .clear_content_changes_if_generation(
+                &instance.id,
+                snapshot.generation,
+            )
+            .await;
+    }
+
     Ok(synced_files)
+}
+
+fn content_path_is_dirty(path: &str, dirty_paths: &HashSet<String>) -> bool {
+    dirty_paths.iter().any(|dirty| {
+        path == dirty
+            || path
+                .strip_prefix(dirty)
+                .is_some_and(|rest| rest.starts_with('/'))
+    })
 }
 
 async fn cache_extracted_icon(
@@ -638,6 +680,18 @@ mod tests {
     };
     use std::fs;
     use std::sync::Arc;
+
+    #[test]
+    fn unchanged_content_paths_reuse_existing_hashes_until_watcher_marks_them_dirty()
+     {
+        let dirty = HashSet::from([
+            "mods/changed.jar".to_string(),
+            "resourcepacks".to_string(),
+        ]);
+        assert!(!content_path_is_dirty("mods/unchanged.jar", &dirty));
+        assert!(content_path_is_dirty("mods/changed.jar", &dirty));
+        assert!(content_path_is_dirty("resourcepacks/pack.zip", &dirty));
+    }
 
     fn modrinth_ref() -> ContentProviderRef {
         ContentProviderRef::Modrinth {

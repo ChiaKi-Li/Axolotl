@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use sqlx::Row;
 
-use super::list_content::list_all_content;
+use super::list_content::list_all_content_from_files;
 use super::sync_content_files::{
     project_type_for_file, sync_instance_content_files,
 };
@@ -258,6 +258,7 @@ async fn get_content_snapshot_inner(
     }
     let mut represented_members = HashSet::new();
     let mut items = Vec::new();
+    let files_for_listing = files.clone();
 
     for file in files.into_iter().filter(|file| !file.missing) {
         let Some(project_type) = project_type_for_file(&file) else {
@@ -482,8 +483,9 @@ async fn get_content_snapshot_inner(
     } else {
         CacheBehaviour::CacheOnly
     };
-    match list_all_content(
+    match list_all_content_from_files(
         instance_id,
+        files_for_listing,
         Some(cache_behaviour),
         refresh_remote,
         state,

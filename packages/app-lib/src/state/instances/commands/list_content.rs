@@ -384,6 +384,37 @@ pub(crate) async fn list_all_content(
     .await
 }
 
+pub(crate) async fn list_all_content_from_files(
+    instance_id: &str,
+    files: Vec<InstanceFile>,
+    cache_behaviour: Option<CacheBehaviour>,
+    refresh_file_updates: bool,
+    state: &State,
+) -> crate::Result<Vec<ContentItem>> {
+    let resolved =
+        resolve_content_scope_with_instance(instance_id, None, &state.pool)
+            .await?;
+    let files = content_projects_for_files(
+        &resolved,
+        files,
+        cache_behaviour,
+        state,
+        ContentFilter::All,
+        refresh_file_updates,
+    )
+    .await?
+    .into_iter()
+    .collect::<Vec<_>>();
+
+    content_files_to_content_items(
+        &resolved.instance,
+        &files,
+        cache_behaviour,
+        state,
+    )
+    .await
+}
+
 pub(crate) async fn list_content_by_paths(
     instance_id: &str,
     paths: &[String],
