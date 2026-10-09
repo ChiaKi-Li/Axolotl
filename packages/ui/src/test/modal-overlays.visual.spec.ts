@@ -1,9 +1,11 @@
 import { afterEach, expect, it } from 'vitest'
-import { h, ref } from 'vue'
+import { defineComponent, effectScope, h, nextTick, ref } from 'vue'
 
 import Combobox from '../components/base/Combobox.vue'
 import MultiSelect from '../components/base/MultiSelect.vue'
+import TeleportOverflowMenu from '../components/base/TeleportOverflowMenu.vue'
 import NewModal from '../components/modal/NewModal.vue'
+import { useBodyScrollLock } from '../composables/body-scroll-lock'
 import { I18N_INJECTION_KEY } from '../providers/i18n'
 import { mountThemed, waitFor } from './visual-harness'
 
@@ -172,4 +174,76 @@ it('respects a nested control consuming Escape inside a dropdown', async () => {
     escape(document.querySelector('#nested-control')!)
     expect(document.querySelector('[role="listbox"]')).not.toBeNull()
     expect(document.querySelector('.modal-container.shown')).not.toBeNull()
+})
+
+it('keeps the parent modal locked when a menu closes or unmounts', async () => {
+    document.body.style.setProperty('overflow', 'scroll', 'important')
+    cleanup.push(() => document.body.style.removeProperty('overflow'))
+    const mounted = ref(true)
+    const Child = defineComponent({
+        setup: () => () =>
+            mounted.value
+                ? h(TeleportOverflowMenu, {
+                      options: [{ id: 'Inspect', action: () => {} }],
+                      label: 'More',
+                  })
+                : null,
+    })
+    const { vm } = await modal(h(Child))
+    const trigger = document.querySelector<HTMLElement>('[aria-haspopup="menu"]')!
+    trigger.click()
+    await waitFor(() => !!document.querySelector('[data-pyro-telepopover-root]'))
+    expect(document.body.style.overflow).toBe('hidden')
+    document.querySelector<HTMLButtonElement>('[data-pyro-telepopover-root] button')!.click()
+    await waitFor(() => !document.querySelector('[data-pyro-telepopover-root]'))
+    expect(document.body.style.overflow).toBe('hidden')
+    trigger.click()
+    await waitFor(() => !!document.querySelector('[data-pyro-telepopover-root]'))
+    mounted.value = false
+    await nextTick()
+    expect(document.body.style.overflow).toBe('hidden')
+    await vm.hide()
+    expect(document.body.style.overflow).toBe('scroll')
+    expect(document.body.style.getPropertyPriority('overflow')).toBe('important')
+})
+
+it('releases only the current owner regardless of close order or repeated calls', () => {
+    const first = effectScope()
+    const second = effectScope()
+    cleanup.push(() => {
+        first.stop()
+        second.stop()
+    })
+    const a = first.run(useBodyScrollLock)!
+    const b = second.run(useBodyScrollLock)!
+    const previous = document.body.style.overflow
+    a.lock()
+    a.lock()
+    b.lock()
+    a.unlock()
+    a.unlock()
+    expect(document.body.style.overflow).toBe('hidden')
+    first.stop()
+    expect(document.body.style.overflow).toBe('hidden')
+    second.stop()
+    expect(document.body.style.overflow).toBe(previous)
+    b.lock()
+    expect(document.body.style.overflow).toBe(previous)
+})
+
+it('restores independent overflow axes and their priorities', () => {
+    document.body.style.setProperty('overflow-x', 'scroll', 'important')
+    document.body.style.setProperty('overflow-y', 'auto')
+    cleanup.push(() => document.body.style.removeProperty('overflow'))
+    const scope = effectScope()
+    const owner = scope.run(useBodyScrollLock)!
+    cleanup.push(() => scope.stop())
+    owner.lock()
+    expect(document.body.style.overflowX).toBe('hidden')
+    expect(document.body.style.overflowY).toBe('hidden')
+    owner.unlock()
+    expect(document.body.style.overflowX).toBe('scroll')
+    expect(document.body.style.overflowY).toBe('auto')
+    expect(document.body.style.getPropertyPriority('overflow-x')).toBe('important')
+    expect(document.body.style.getPropertyPriority('overflow-y')).toBe('')
 })

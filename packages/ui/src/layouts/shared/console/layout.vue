@@ -205,6 +205,7 @@ import LoadingIndicator from '#ui/components/base/LoadingIndicator.vue'
 import StyledInput from '#ui/components/base/StyledInput.vue'
 import NewModal from '#ui/components/modal/NewModal.vue'
 import ShareModal from '#ui/components/modal/ShareModal.vue'
+import { useBodyScrollLock } from '#ui/composables/body-scroll-lock'
 import { useVIntl } from '#ui/composables/i18n'
 import { injectModrinthClient } from '#ui/providers'
 import { injectModalBehavior } from '#ui/providers/modal-behavior'
@@ -667,6 +668,7 @@ const fontSizeOptions = computed<ComboboxOption<number>[]>(() =>
 )
 
 const isFullscreen = ref(false)
+const { lock: lockBodyScroll, unlock: unlockBodyScroll } = useBodyScrollLock()
 const fullscreenBodyClass = 'modrinth-console-fullscreen-active'
 const fullscreenIntercomPadding = 20
 const fullscreenIntercomPaddingRequestId = Symbol('console-fullscreen')
@@ -721,7 +723,7 @@ const filteredLines = computed(() => {
 
 onBeforeUnmount(() => {
     if (isFullscreen.value) {
-        document.body.style.overflow = ''
+        unlockBodyScroll()
         document.body.classList.remove(fullscreenBodyClass)
         window.dispatchEvent(new CustomEvent('modrinth-console-fullscreen', { detail: false }))
         pageContext?.intercomBubble?.requestHorizontalPadding?.(
@@ -826,7 +828,7 @@ async function toggleFullscreen() {
     const viewportState = viewportRef.value?.captureViewState()
     isFullscreen.value = !isFullscreen.value
     if (isFullscreen.value) {
-        document.body.style.overflow = 'hidden'
+        lockBodyScroll()
         document.body.classList.add(fullscreenBodyClass)
         // Let the shell collapse the account sidebar so the collapse control
         // stays reachable and the expanded pane uses the full width (#584).
@@ -837,7 +839,7 @@ async function toggleFullscreen() {
         )
         modalBehavior?.onShow?.()
     } else {
-        document.body.style.overflow = ''
+        unlockBodyScroll()
         document.body.classList.remove(fullscreenBodyClass)
         window.dispatchEvent(new CustomEvent('modrinth-console-fullscreen', { detail: false }))
         pageContext?.intercomBubble?.requestHorizontalPadding?.(

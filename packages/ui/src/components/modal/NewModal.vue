@@ -144,6 +144,7 @@
 import { XIcon } from '@modrinth/assets'
 import { computed, nextTick, onUnmounted, ref } from 'vue'
 
+import { useBodyScrollLock } from '../../composables/body-scroll-lock'
 import { useVIntl } from '../../composables/i18n'
 import { useModalStack } from '../../composables/modal-stack'
 import { useScrollIndicator } from '../../composables/scroll-indicator'
@@ -232,6 +233,7 @@ const headerId = `${modalId}-header`
 const closeLabel = computed(() => formatMessage(commonMessages.closeButton))
 
 const open = ref(false)
+const { lock: lockBodyScroll, unlock: unlockBodyScroll } = useBodyScrollLock()
 const visible = ref(false)
 const stackDepth = ref(0)
 const modalBodyRef = ref<HTMLElement | null>(null)
@@ -257,7 +259,7 @@ function show(event?: MouseEvent) {
     pushModal()
     if (wasEmpty) modalBehavior?.onShow?.()
 
-    document.body.style.overflow = 'hidden'
+    lockBodyScroll()
     window.addEventListener('keydown', handleWindowKeyDown)
     window.addEventListener('mousedown', updateMousePosition)
     if (event) {
@@ -290,9 +292,9 @@ async function hide() {
     resetMousePosition()
     visible.value = false
     popModal()
+    unlockBodyScroll()
     if (modalStackSize() === 0) {
         modalBehavior?.onHide?.()
-        document.body.style.overflow = ''
     }
     window.removeEventListener('keydown', handleWindowKeyDown)
     window.removeEventListener('mousedown', updateMousePosition)
@@ -353,10 +355,10 @@ function resetMousePosition() {
 onUnmounted(() => {
     if (open.value) {
         popModal()
+        unlockBodyScroll()
         window.removeEventListener('keydown', handleWindowKeyDown)
         window.removeEventListener('mousedown', updateMousePosition)
         if (modalStackSize() === 0) {
-            document.body.style.overflow = ''
             modalBehavior?.onHide?.()
         }
     }

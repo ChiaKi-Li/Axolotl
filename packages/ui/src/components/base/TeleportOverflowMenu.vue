@@ -102,6 +102,7 @@ import { AutoLink } from '@modrinth/ui'
 import { onClickOutside, useElementHover } from '@vueuse/core'
 import { type Component, computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 
+import { useBodyScrollLock } from '../../composables/body-scroll-lock'
 import Button from './buttons/Button.vue'
 import ButtonLink from './buttons/ButtonLink.vue'
 import IconButton from './buttons/IconButton.vue'
@@ -151,6 +152,7 @@ const emit = defineEmits<{
 }>()
 
 const isOpen = ref(false)
+const { lock: disableBodyScroll, unlock: enableBodyScroll } = useBodyScrollLock()
 const selectedIndex = ref(-1)
 const menuRef = ref<HTMLElement | null>(null)
 const triggerRef = ref<ButtonElementHandle | null>(null)
@@ -224,10 +226,12 @@ const toggleMenu = (event: MouseEvent) => {
 }
 
 const openMenu = () => {
+    if (props.disabled || isOpen.value) return
     isOpen.value = true
     emit('open')
     disableBodyScroll()
     nextTick(() => {
+        if (!isOpen.value) return
         menuStyle.value = calculateMenuPosition()
         document.addEventListener('mousemove', handleMouseMove)
         focusFirstMenuItem()
@@ -302,14 +306,6 @@ const handleItemClick = (option: Option, index: number) => {
 const handleMouseOver = (index: number) => {
     selectedIndex.value = index
     menuItemsRef.value[selectedIndex.value]?.focus?.()
-}
-
-const disableBodyScroll = () => {
-    document.body.style.overflow = 'hidden'
-}
-
-const enableBodyScroll = () => {
-    document.body.style.overflow = ''
 }
 
 const focusFirstMenuItem = () => {
