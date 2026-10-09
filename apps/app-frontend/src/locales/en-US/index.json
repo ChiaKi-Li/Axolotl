@@ -1,7 +1,4 @@
 {
-  "app.settings.environment-variables.invalid-format": {
-    "message": "Use NAME=value, separated by spaces. A name and an equals sign are required; the value may be empty or contain more equals signs."
-  },
   "app.account.signed-in-as": {
     "message": "Signed in as"
   },
@@ -3491,26 +3488,26 @@
   "app.instances.batch-edit-groups.header": {
     "message": "Create group"
   },
-  "app.instances.batch-edit-groups.no-instances-found": {
-    "message": "No instances found"
-  },
-  "app.instances.batch-edit-groups.save-changes": {
-    "message": "Save"
+  "app.instances.batch-edit-groups.load-failed": {
+    "message": "Could not load instances. Try again."
   },
   "app.instances.batch-edit-groups.loading": {
     "message": "Loading instances…"
   },
-  "app.instances.batch-edit-groups.load-failed": {
-    "message": "Could not load instances. Try again."
+  "app.instances.batch-edit-groups.membership-failed": {
+    "message": "The group was created, but its instances could not be saved. Retry to finish saving your changes."
+  },
+  "app.instances.batch-edit-groups.no-instances-found": {
+    "message": "No instances found"
   },
   "app.instances.batch-edit-groups.retry": {
     "message": "Retry"
   },
+  "app.instances.batch-edit-groups.save-changes": {
+    "message": "Save"
+  },
   "app.instances.batch-edit-groups.save-failed": {
     "message": "Could not save the group. Your changes are kept; try again."
-  },
-  "app.instances.batch-edit-groups.membership-failed": {
-    "message": "The group was created, but its instances could not be saved. Retry to finish saving your changes."
   },
   "app.instances.batch-edit-groups.search-instance": {
     "message": "Search instances"
@@ -8197,6 +8194,9 @@
   },
   "app.settings.downloading": {
     "message": "Downloading v{version}"
+  },
+  "app.settings.environment-variables.invalid-format": {
+    "message": "Use NAME=value, separated by spaces. A name and an equals sign are required; the value may be empty or contain more equals signs."
   },
   "app.settings.feature-flags.advanced-filters-collapsed": {
     "message": "Collapse advanced filters by default"

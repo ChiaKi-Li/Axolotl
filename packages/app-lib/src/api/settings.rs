@@ -67,6 +67,118 @@ async fn patch_with_pool(
     Ok(saved)
 }
 
+/// Merges field-level changes while serializing settings writes.
+pub async fn patch(patch: serde_json::Value) -> crate::Result<Settings> {
+    let _guard = SETTINGS_WRITE.lock().await;
+    let state = State::get().await?;
+    let settings = patch_with_pool(&state.pool, patch).await?;
+    state.update_http_client_for_settings(&settings).await?;
+    state.update_download_settings(&settings);
+    Ok(settings)
+}
+
+/// Gets entire settings
+#[tracing::instrument]
+pub async fn get() -> crate::Result<Settings> {
+    let state = State::get().await?;
+    let settings = Settings::get(&state.pool).await?;
+    Ok(settings)
+}
+
+#[tracing::instrument]
+pub async fn get_privacy() -> crate::Result<PrivacySettings> {
+    let state = State::get().await?;
+    let settings = Settings::get(&state.pool).await?;
+    Ok(PrivacySettings {
+        telemetry: settings.telemetry,
+        discord_rpc: settings.discord_rpc,
+        consent_version: settings.telemetry_consent_version,
+    })
+}
+
+#[tracing::instrument]
+pub async fn set_privacy(
+    privacy: PrivacySettings,
+) -> crate::Result<PrivacySettings> {
+    let _guard = SETTINGS_WRITE.lock().await;
+    let state = State::get().await?;
+    let mut transaction = state.pool.begin().await?;
+    sqlx::query(
+		"UPDATE settings SET telemetry = ?, discord_rpc = ?, telemetry_consent_version = ? WHERE id = 0",
+	)
+	.bind(privacy.telemetry)
+	.bind(privacy.discord_rpc)
+	.bind(privacy.consent_version)
+	.execute(&mut *transaction)
+	.await?;
+    sqlx::query("DELETE FROM telemetry_outbox")
+        .execute(&mut *transaction)
+        .await?;
+    transaction.commit().await?;
+
+    if let Err(error) =
+        crate::telemetry::set_enabled(&state, privacy.telemetry).await
+    {
+        tracing::debug!(target: "theseus::telemetry", %error, "Failed to apply telemetry state");
+    }
+    if let Err(error) = state.discord_rpc.clear_to_default(true).await {
+        tracing::debug!(target: "theseus::telemetry", %error, "Failed to apply Discord RPC state");
+    }
+    get_privacy().await
+}
+
+#[tracing::instrument]
+pub async fn set_telemetry(enabled: bool) -> crate::Result<PrivacySettings> {
+    let _guard = SETTINGS_WRITE.lock().await;
+    let state = State::get().await?;
+    let mut transaction = state.pool.begin().await?;
+    sqlx::query("UPDATE settings SET telemetry = ? WHERE id = 0")
+        .bind(enabled)
+        .execute(&mut *transaction)
+        .await?;
+    sqlx::query("DELETE FROM telemetry_outbox")
+        .execute(&mut *transaction)
+        .await?;
+    transaction.commit().await?;
+    if let Err(error) = crate::telemetry::set_enabled(&state, enabled).await {
+        tracing::debug!(target: "theseus::telemetry", %error, "Failed to apply telemetry state");
+    }
+    get_privacy().await
+}
+
+#[tracing::instrument]
+pub async fn set_discord_rpc(enabled: bool) -> crate::Result<PrivacySettings> {
+    let _guard = SETTINGS_WRITE.lock().await;
+    let state = State::get().await?;
+    sqlx::query("UPDATE settings SET discord_rpc = ? WHERE id = 0")
+        .bind(enabled)
+        .execute(&state.pool)
+        .await?;
+    if let Err(error) = state.discord_rpc.clear_to_default(true).await {
+        tracing::debug!(target: "theseus::telemetry", %error, "Failed to apply Discord RPC state");
+    }
+    get_privacy().await
+}
+
+#[tracing::instrument]
+pub async fn cancel_directory_change(
+    app_identifier: &str,
+) -> crate::Result<()> {
+    // This is called to handle state initialization errors due to folder migrations
+    // failing, so fetching a DB connection pool from `State::get` is not reliable here
+    let pool = crate::state::db::connect(app_identifier).await?;
+    let mut settings = Settings::get(&pool).await?;
+
+    if let Some(prev_custom_dir) = settings.prev_custom_dir {
+        settings.prev_custom_dir = None;
+        settings.custom_dir = Some(prev_custom_dir);
+    }
+
+    settings.update(&pool).await?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,116 +323,4 @@ mod tests {
             serde_json::to_value(initial).unwrap()
         );
     }
-}
-
-/// Merges field-level changes while serializing settings writes.
-pub async fn patch(patch: serde_json::Value) -> crate::Result<Settings> {
-    let _guard = SETTINGS_WRITE.lock().await;
-    let state = State::get().await?;
-    let settings = patch_with_pool(&state.pool, patch).await?;
-    state.update_http_client_for_settings(&settings).await?;
-    state.update_download_settings(&settings);
-    Ok(settings)
-}
-
-/// Gets entire settings
-#[tracing::instrument]
-pub async fn get() -> crate::Result<Settings> {
-    let state = State::get().await?;
-    let settings = Settings::get(&state.pool).await?;
-    Ok(settings)
-}
-
-#[tracing::instrument]
-pub async fn get_privacy() -> crate::Result<PrivacySettings> {
-    let state = State::get().await?;
-    let settings = Settings::get(&state.pool).await?;
-    Ok(PrivacySettings {
-        telemetry: settings.telemetry,
-        discord_rpc: settings.discord_rpc,
-        consent_version: settings.telemetry_consent_version,
-    })
-}
-
-#[tracing::instrument]
-pub async fn set_privacy(
-    privacy: PrivacySettings,
-) -> crate::Result<PrivacySettings> {
-    let _guard = SETTINGS_WRITE.lock().await;
-    let state = State::get().await?;
-    let mut transaction = state.pool.begin().await?;
-    sqlx::query(
-		"UPDATE settings SET telemetry = ?, discord_rpc = ?, telemetry_consent_version = ? WHERE id = 0",
-	)
-	.bind(privacy.telemetry)
-	.bind(privacy.discord_rpc)
-	.bind(privacy.consent_version)
-	.execute(&mut *transaction)
-	.await?;
-    sqlx::query("DELETE FROM telemetry_outbox")
-        .execute(&mut *transaction)
-        .await?;
-    transaction.commit().await?;
-
-    if let Err(error) =
-        crate::telemetry::set_enabled(&state, privacy.telemetry).await
-    {
-        tracing::debug!(target: "theseus::telemetry", %error, "Failed to apply telemetry state");
-    }
-    if let Err(error) = state.discord_rpc.clear_to_default(true).await {
-        tracing::debug!(target: "theseus::telemetry", %error, "Failed to apply Discord RPC state");
-    }
-    get_privacy().await
-}
-
-#[tracing::instrument]
-pub async fn set_telemetry(enabled: bool) -> crate::Result<PrivacySettings> {
-    let _guard = SETTINGS_WRITE.lock().await;
-    let state = State::get().await?;
-    let mut transaction = state.pool.begin().await?;
-    sqlx::query("UPDATE settings SET telemetry = ? WHERE id = 0")
-        .bind(enabled)
-        .execute(&mut *transaction)
-        .await?;
-    sqlx::query("DELETE FROM telemetry_outbox")
-        .execute(&mut *transaction)
-        .await?;
-    transaction.commit().await?;
-    if let Err(error) = crate::telemetry::set_enabled(&state, enabled).await {
-        tracing::debug!(target: "theseus::telemetry", %error, "Failed to apply telemetry state");
-    }
-    get_privacy().await
-}
-
-#[tracing::instrument]
-pub async fn set_discord_rpc(enabled: bool) -> crate::Result<PrivacySettings> {
-    let _guard = SETTINGS_WRITE.lock().await;
-    let state = State::get().await?;
-    sqlx::query("UPDATE settings SET discord_rpc = ? WHERE id = 0")
-        .bind(enabled)
-        .execute(&state.pool)
-        .await?;
-    if let Err(error) = state.discord_rpc.clear_to_default(true).await {
-        tracing::debug!(target: "theseus::telemetry", %error, "Failed to apply Discord RPC state");
-    }
-    get_privacy().await
-}
-
-#[tracing::instrument]
-pub async fn cancel_directory_change(
-    app_identifier: &str,
-) -> crate::Result<()> {
-    // This is called to handle state initialization errors due to folder migrations
-    // failing, so fetching a DB connection pool from `State::get` is not reliable here
-    let pool = crate::state::db::connect(app_identifier).await?;
-    let mut settings = Settings::get(&pool).await?;
-
-    if let Some(prev_custom_dir) = settings.prev_custom_dir {
-        settings.prev_custom_dir = None;
-        settings.custom_dir = Some(prev_custom_dir);
-    }
-
-    settings.update(&pool).await?;
-
-    Ok(())
 }
