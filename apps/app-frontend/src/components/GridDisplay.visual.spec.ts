@@ -14,7 +14,14 @@ vi.mock('@/helpers/instance', () => ({
     set_pinned: vi.fn(),
 }))
 vi.mock('@/helpers/instance-backup', () => ({ getBackupDeleteSummary: async () => null }))
-vi.mock('@/helpers/events', () => ({ instance_groups_listener: vi.fn() }))
+vi.mock('@/helpers/events', () => ({
+    instance_groups_listener: async () => () => {},
+    process_listener: async () => () => {},
+}))
+vi.mock('@/helpers/process', () => ({
+    get_all: async () => [],
+    get_by_instance_id: async () => [],
+}))
 vi.mock('@/helpers/instance-groups', () => ({
     list_groups: async () => [{ id: 'a', name: 'Group A' }],
     create_group: vi.fn(),
