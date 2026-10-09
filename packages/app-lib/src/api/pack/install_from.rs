@@ -422,6 +422,7 @@ pub(crate) async fn generate_pack_from_version_id_with_reporter(
     let download_result = download_to_path(
         DownloadRequest::new(primary_pack_url, ResourceClass::Modpack)
             .with_provider_script_policy()
+            .with_provider_initial_size_check()
             .with_exact_candidate_urls(pack_urls.iter().skip(1).cloned())
             .with_integrity(Integrity {
                 size: Some(pack_file.size as u64),

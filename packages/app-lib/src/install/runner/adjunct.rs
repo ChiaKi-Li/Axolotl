@@ -266,6 +266,7 @@ pub(crate) async fn install_optifabric_file(
             verification_tx: None,
             pre_resolved_relative_path: None,
                     expected_file_name: None,
+            provider_batch: crate::util::fetch::ProviderDownloadBatch::default(),
         },
     )
     .await?;

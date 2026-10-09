@@ -694,6 +694,7 @@ pub async fn restore_pack_member_default(
                     verification_tx: None,
                     pre_resolved_relative_path: None,
                     expected_file_name: None,
+					provider_batch: crate::util::fetch::ProviderDownloadBatch::default(),
 					instance_id: instance_id.to_string(),
 					project_id: project_id.parse().map_err(|_| {
 						crate::ErrorKind::InputError(

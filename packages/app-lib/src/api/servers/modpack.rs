@@ -550,6 +550,9 @@ async fn download_with_engine(
             .with_provider_script_policy()
             .with_provider_batch_size(provider_batch_size)
             .with_exact_candidate_urls(provider_urls.iter().skip(1).cloned());
+        if resource == ResourceClass::Modpack {
+            request = request.with_provider_initial_size_check();
+        }
         if browser_headers {
             request = request.with_provider_browser_headers();
         }

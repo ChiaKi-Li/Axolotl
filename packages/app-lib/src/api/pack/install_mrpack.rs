@@ -24,7 +24,7 @@ use crate::state::{
 };
 use crate::util::fetch::{
     ContentValidation, DownloadMeta, DownloadReason, DownloadRequest,
-    Integrity, ResourceClass, download_to_path,
+    Integrity, ProviderDownloadBatch, ResourceClass, download_to_path,
 };
 use crate::util::io;
 use async_zip::base::read::seek::ZipFileReader as SeekZipFileReader;
@@ -1259,6 +1259,7 @@ pub(crate) async fn install_zipped_mrpack_files_with_reporter(
             })
             .count()
             .max(1);
+        let provider_batch = ProviderDownloadBatch::new(provider_batch_size);
         let finalize_semaphore =
             Arc::new(Semaphore::new(NATIVE_CONTENT_FINALIZE_CONCURRENCY));
         let (completion_tx, mut completion_rx) =
@@ -1533,6 +1534,7 @@ pub(crate) async fn install_zipped_mrpack_files_with_reporter(
                 skipped_missing_content_paths.clone();
             let finalize_semaphore = finalize_semaphore.clone();
             let verification_tx = verification_tx.clone();
+            let provider_batch = provider_batch.clone();
              async move {
                 let project_size = project.file_size as u64;
                 let project_path =
@@ -1667,7 +1669,7 @@ pub(crate) async fn install_zipped_mrpack_files_with_reporter(
                 let download = match download_to_path(
                     DownloadRequest::new(primary_url, ResourceClass::Modpack)
                         .with_provider_script_policy()
-                        .with_provider_batch_size(provider_batch_size)
+                        .with_provider_batch(provider_batch)
                         .with_provider_browser_headers()
                         .with_exact_candidate_urls(
                             download_urls.iter().skip(1).cloned(),

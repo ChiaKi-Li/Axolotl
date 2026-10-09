@@ -21,8 +21,8 @@ use crate::state::{
 };
 use crate::util::fetch::{
     DownloadRequest, DownloadRouteSource, FetchProgressFn, Integrity,
-    ProxyPolicy, ResourceClass, download_to_path, resolve_download_routes_for,
-    sha1_file_async, sha1_file_cancellable,
+    ProviderDownloadBatch, ProxyPolicy, ResourceClass, download_to_path,
+    resolve_download_routes_for, sha1_file_async, sha1_file_cancellable,
 };
 use crate::{ErrorKind, State};
 use dashmap::DashMap;
@@ -507,6 +507,8 @@ pub struct CurseForgeInstallRequest {
     pub(crate) pre_resolved_relative_path: Option<String>,
     #[serde(skip)]
     pub(crate) expected_file_name: Option<String>,
+    #[serde(skip)]
+    pub(crate) provider_batch: ProviderDownloadBatch,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -538,6 +540,7 @@ pub(crate) async fn stage_curseforge_upgrade_file(
     file_id: u32,
     project_type: Option<ProjectType>,
     reporter: Option<&InstallProgressReporter>,
+    provider_batch: ProviderDownloadBatch,
 ) -> crate::Result<StagedCurseForgeUpgrade> {
     let file = get_file(project_id, file_id).await?;
     if file.mod_id != project_id || file.id != file_id {
@@ -585,6 +588,8 @@ pub(crate) async fn stage_curseforge_upgrade_file(
         None,
         true,
         true,
+        false,
+        provider_batch,
     )
     .await?;
     verify_installed_curseforge_file(&path, &file, None, None).await?;
@@ -1581,6 +1586,8 @@ pub async fn install_world_with_reporter(
         None,
         true,
         true,
+        false,
+        ProviderDownloadBatch::default(),
     )
     .await?;
     let world_name = crate::state::instances::commands::import_world_save(
@@ -1772,6 +1779,7 @@ async fn install_file_with_metrics(
                     .pre_resolved_relative_path
                     .as_deref(),
                 expected_file_name: request.expected_file_name.as_deref(),
+                provider_batch: request.provider_batch.clone(),
             })
             .await?;
         let relative_path = downloaded.relative_path.clone();
@@ -2460,6 +2468,7 @@ async fn install_fixed_curseforge_content(
         verification_tx: None,
         pre_resolved_relative_path: None,
         expected_file_name: request.expected_file_name.as_deref(),
+        provider_batch: request.provider_batch.clone(),
     })
     .await?;
     result.installed.push(CurseForgeInstalledFile {
@@ -3687,6 +3696,18 @@ pub async fn install_modpack_with_reporter(
         .collect::<Vec<_>>();
     let projects = get_modpack_projects(project_ids).await?;
 
+    let provider_batch = ProviderDownloadBatch::new(
+        selected_files
+            .iter()
+            .filter(|file| {
+                projects.get(&file.project_id).is_some_and(|project| {
+                    state.bypass_curseforge_download_restrictions()
+                        || project.allow_mod_distribution != Some(false)
+                })
+            })
+            .count(),
+    );
+
     let instance_name = crate::api::instance::get(&request.instance_id)
         .await?
         .map(|metadata| metadata.instance.name)
@@ -3842,6 +3863,7 @@ pub async fn install_modpack_with_reporter(
             let verification_tx = verification_tx.clone();
             let cancellation = cancellation.clone();
             let existing_relative_paths = existing_relative_paths.clone();
+            let provider_batch = provider_batch.clone();
             async move {
                 if cancellation.is_cancelled() {
                     return Err(ErrorKind::OtherError("download canceled".to_string()).into());
@@ -3910,6 +3932,7 @@ pub async fn install_modpack_with_reporter(
                         Some(verification_tx.clone()),
                         Some(pre_resolved_relative_path),
                         Some((project.clone(), meta.clone())),
+                        provider_batch.clone(),
                     )
                     .await;
                 active_download.finish();
@@ -4332,6 +4355,7 @@ async fn install_preloaded_modpack_file(
             .pre_resolved_relative_path
             .as_deref(),
         expected_file_name: request.expected_file_name.as_deref(),
+        provider_batch: request.provider_batch.clone(),
     })
     .await?;
     Ok(CurseForgeInstallResult {
@@ -4358,6 +4382,7 @@ async fn retry_modpack_file_install(
     verification_tx: Option<mpsc::Sender<CurseForgeVerificationTask>>,
     pre_resolved_relative_path: Option<String>,
     preloaded: Option<(CurseForgeProject, CurseForgeFile)>,
+    provider_batch: ProviderDownloadBatch,
 ) -> (
     Option<CurseForgeInstallResult>,
     Option<CurseForgeInstallResult>,
@@ -4390,6 +4415,7 @@ async fn retry_modpack_file_install(
             verification_tx: verification_tx.clone(),
             pre_resolved_relative_path: pre_resolved_relative_path.clone(),
             expected_file_name: Some(expected_file_name.to_string()),
+            provider_batch: provider_batch.clone(),
         };
         let result = match preloaded.as_ref() {
             Some((project, file)) => {
@@ -4728,6 +4754,18 @@ pub(crate) async fn install_local_manifest_files(
         .collect::<Vec<_>>();
     let projects = get_modpack_projects(project_ids).await?;
 
+    let provider_batch = ProviderDownloadBatch::new(
+        selected_files
+            .iter()
+            .filter(|file| {
+                projects.get(&file.project_id).is_some_and(|project| {
+                    state.bypass_curseforge_download_restrictions()
+                        || project.allow_mod_distribution != Some(false)
+                })
+            })
+            .count(),
+    );
+
     let total_files = selected_files.len().max(1);
     let file_ids = selected_files
         .iter()
@@ -4836,6 +4874,7 @@ pub(crate) async fn install_local_manifest_files(
             let minecraft_version = minecraft_version.to_string();
             let verification_tx = verification_tx.clone();
             let existing_relative_paths = existing_relative_paths.clone();
+            let provider_batch = provider_batch.clone();
             let cancellation = cancellation.clone();
             async move {
                 if cancellation.is_cancelled() {
@@ -4905,6 +4944,7 @@ pub(crate) async fn install_local_manifest_files(
                         Some(verification_tx.clone()),
                         Some(pre_resolved_relative_path),
                         Some((project.clone(), meta.clone())),
+                        provider_batch.clone(),
                     )
                     .await;
                 active_download.finish();
@@ -6159,6 +6199,7 @@ pub(crate) async fn prepare_curseforge_content_change_action(
         verification_tx: None,
         pre_resolved_relative_path: None,
         expected_file_name: None,
+        provider_batch: ProviderDownloadBatch::default(),
     })
     .await?;
     let old_provider_file_name = match action.expected_release_id.as_deref() {
@@ -6346,6 +6387,7 @@ async fn install_selected_file(
         verification_tx: None,
         pre_resolved_relative_path: None,
         expected_file_name: None,
+        provider_batch: ProviderDownloadBatch::default(),
     };
     let mut result = match reporter {
         Some(reporter) => install_file_with_reporter(request, reporter).await?,
@@ -8753,6 +8795,8 @@ async fn download_curseforge_path(
     h2_range_concurrency: Option<usize>,
     allow_http1_segmented_download: bool,
     browser_headers: bool,
+    check_initial_size: bool,
+    provider_batch: ProviderDownloadBatch,
 ) -> crate::Result<crate::util::fetch::DownloadResult> {
     let state = State::get().await?;
     let urls = curseforge_candidate_urls(url)?;
@@ -8760,18 +8804,24 @@ async fn download_curseforge_path(
     let mut request =
         DownloadRequest::new(primary_url, ResourceClass::CurseForge)
             .with_provider_script_policy()
+            .with_provider_batch(provider_batch)
             .with_exact_candidate_urls(urls.iter().skip(1).cloned())
             .with_integrity(curseforge_integrity(file))
             .with_http1_segmented_download(allow_http1_segmented_download);
+    if check_initial_size {
+        request = request.with_provider_initial_size_check();
+    }
     if browser_headers {
         request = request.with_provider_browser_headers();
     }
     if let Some(concurrency) = h2_range_concurrency {
         request = request.with_h2_range_concurrency(concurrency);
     }
-    let parsed = reqwest::Url::parse(url)?;
-    if is_forge_cdn_url(&parsed)
-        && let Some(key) = api_key()
+    if urls.iter().any(|url| {
+        reqwest::Url::parse(url)
+            .ok()
+            .is_some_and(|parsed| is_forge_cdn_url(&parsed))
+    }) && let Some(key) = api_key()
     {
         request = request.with_header("x-api-key", key);
     }
@@ -8820,6 +8870,8 @@ async fn download_curseforge_archive(
         curseforge_modpack_h2_range_concurrency(file.file_length),
         true,
         false,
+        true,
+        ProviderDownloadBatch::default(),
     )
     .await
 }
@@ -8839,6 +8891,7 @@ struct DownloadInstalledFileRequest<'a> {
     verification_tx: Option<&'a mpsc::Sender<CurseForgeVerificationTask>>,
     pre_resolved_relative_path: Option<&'a str>,
     expected_file_name: Option<&'a str>,
+    provider_batch: ProviderDownloadBatch,
 }
 
 struct DownloadedCurseForgeFile {
@@ -9337,6 +9390,7 @@ async fn download_installed_file(
         verification_tx,
         pre_resolved_relative_path,
         expected_file_name,
+        provider_batch,
     } = request;
     if file.mod_id != project_id || file.id != file_id {
         return Err(ErrorKind::InputError(
@@ -9396,6 +9450,8 @@ async fn download_installed_file(
         None,
         false,
         true,
+        false,
+        provider_batch,
     )
     .await?;
     if let Some(download_metrics) = download_metrics {
@@ -11528,6 +11584,7 @@ mod tests {
                     verification_tx: None,
                     pre_resolved_relative_path: None,
         expected_file_name: None,
+                    provider_batch: ProviderDownloadBatch::default(),
                 },
                 display_title: "CurseForge".to_string(),
                 display_icon: None,

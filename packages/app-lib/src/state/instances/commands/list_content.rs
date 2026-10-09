@@ -2554,6 +2554,7 @@ async fn get_modpack_identifiers(
         });
     }
 
+    let api_started = tokio::time::Instant::now();
     let version = CachedEntry::get_version(
         &ModrinthVersionId::new(version_id.to_string())?,
         None,
@@ -2566,6 +2567,7 @@ async fn get_modpack_identifiers(
             "Modpack version {version_id} not found"
         ))
     })?;
+    let modrinth_api_latency = api_started.elapsed();
     let primary_file = version
         .files
         .iter()
@@ -2605,7 +2607,7 @@ async fn get_modpack_identifiers(
     let download_urls =
         crate::util::download::provider_policy::modrinth_pack_urls(
             std::slice::from_ref(&primary_file.url),
-            None,
+            Some(modrinth_api_latency),
         );
     let Some(primary_url) = download_urls.first() else {
         return Err(crate::ErrorKind::InputError(
@@ -2616,6 +2618,7 @@ async fn get_modpack_identifiers(
     download_to_path(
         DownloadRequest::new(primary_url, ResourceClass::Modpack)
             .with_provider_script_policy()
+            .with_provider_initial_size_check()
             .with_exact_candidate_urls(download_urls.iter().skip(1).cloned())
             .with_integrity(Integrity {
                 size: Some(primary_file.size as u64),

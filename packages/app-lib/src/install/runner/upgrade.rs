@@ -954,16 +954,32 @@ async fn stage_upgrade_content(
             }])
             .await?;
     }
+    let modrinth_batch = crate::util::fetch::ProviderDownloadBatch::new(
+        contexts
+            .iter()
+            .filter(|context| context.provider == ContentProvider::Modrinth)
+            .count(),
+    );
+    let curseforge_batch = crate::util::fetch::ProviderDownloadBatch::new(
+        contexts
+            .iter()
+            .filter(|context| context.provider == ContentProvider::CurseForge)
+            .count(),
+    );
     let mut downloads = contexts
         .into_iter()
         .map(|context| {
             let reporter = reporter.clone();
+            let modrinth_batch = modrinth_batch.clone();
+            let curseforge_batch = curseforge_batch.clone();
             async move {
                 let index = context.index;
                 let mutation = stage_one_upgrade_request(
                     instance_id,
                     context,
                     reporter,
+                    modrinth_batch,
+                    curseforge_batch,
                     state,
                 )
                 .await?;
@@ -992,6 +1008,8 @@ async fn stage_one_upgrade_request(
     instance_id: &str,
     context: UpgradeStagingRequest,
     reporter: Option<InstallProgressReporter>,
+    modrinth_batch: crate::util::fetch::ProviderDownloadBatch,
+    curseforge_batch: crate::util::fetch::ProviderDownloadBatch,
     state: &State,
 ) -> crate::Result<StagedUpgradeMutation> {
     let download = match context.provider {
@@ -1007,10 +1025,11 @@ async fn stage_one_upgrade_request(
                         },
                         None,
                         reporter.clone(),
+                        modrinth_batch,
                         state,
                     )
                     .await?,
-                    None => crate::state::instances::commands::download_project_version(
+                    None => crate::state::instances::commands::download_project_version_with_batch(
                         instance_id,
                         &context.release_id,
                         if context.auto_dependency {
@@ -1019,6 +1038,9 @@ async fn stage_one_upgrade_request(
                             DownloadReason::Update
                         },
                         None,
+                        None,
+                        None,
+                        modrinth_batch,
                         state,
                     )
                     .await?,
@@ -1041,6 +1063,7 @@ async fn stage_one_upgrade_request(
                         file_id,
                         context.project_type,
                         reporter.as_ref(),
+                        curseforge_batch,
                     )
                     .await?,
                 )

@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 use super::apply_content_install::{
     DownloadedProjectVersion, add_downloaded_project_version,
     add_project_from_version, add_resolved_content, archive_project_file,
-    content_ownership_for_path, download_project_version,
+    content_ownership_for_path, download_project_version_with_batch,
     finalize_updated_project_path, persist_resolved_plan_dependency_edges,
     primary_version_file_name, remove_project, resolve_content_scope,
     resolve_update_plan, toggle_disable_project,
@@ -439,6 +439,9 @@ async fn download_planned_projects(
     )
     .await?;
 
+    let provider_batch = crate::util::fetch::ProviderDownloadBatch::new(
+        plan.project_updates.len() + plan.dependency_additions.len(),
+    );
     let mut downloads = futures::stream::iter(
         plan.project_updates
             .iter()
@@ -451,37 +454,46 @@ async fn download_planned_projects(
                     .map(PlannedDownload::DependencyAddition),
             ),
     )
-    .map(|download| async move {
-        match download {
-            PlannedDownload::ProjectUpdate(update) => {
-                let downloaded = download_project_version(
-                    instance_id,
-                    &update.update_version_id,
-                    DownloadReason::Update,
-                    Some(update.current_version_id.clone()),
-                    state,
-                )
-                .await?;
+    .map(|download| {
+        let provider_batch = provider_batch.clone();
+        async move {
+            match download {
+                PlannedDownload::ProjectUpdate(update) => {
+                    let downloaded = download_project_version_with_batch(
+                        instance_id,
+                        &update.update_version_id,
+                        DownloadReason::Update,
+                        Some(update.current_version_id.clone()),
+                        None,
+                        None,
+                        provider_batch,
+                        state,
+                    )
+                    .await?;
 
-                Ok::<_, crate::Error>(DownloadedBulkProject::ProjectUpdate(
-                    update, downloaded,
-                ))
-            }
-            PlannedDownload::DependencyAddition(dependency) => {
-                let downloaded = download_project_version(
-                    instance_id,
-                    &dependency.version_id,
-                    DownloadReason::Dependency,
-                    Some(dependency.parent_version_id.clone()),
-                    state,
-                )
-                .await?;
+                    Ok::<_, crate::Error>(DownloadedBulkProject::ProjectUpdate(
+                        update, downloaded,
+                    ))
+                }
+                PlannedDownload::DependencyAddition(dependency) => {
+                    let downloaded = download_project_version_with_batch(
+                        instance_id,
+                        &dependency.version_id,
+                        DownloadReason::Dependency,
+                        Some(dependency.parent_version_id.clone()),
+                        None,
+                        None,
+                        provider_batch,
+                        state,
+                    )
+                    .await?;
 
-                Ok::<_, crate::Error>(
-                    DownloadedBulkProject::DependencyAddition(
-                        dependency, downloaded,
-                    ),
-                )
+                    Ok::<_, crate::Error>(
+                        DownloadedBulkProject::DependencyAddition(
+                            dependency, downloaded,
+                        ),
+                    )
+                }
             }
         }
     })

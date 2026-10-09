@@ -19,7 +19,7 @@ use crate::state::{
 };
 use crate::util::fetch::{
     self, ContentValidation, DownloadMeta, DownloadReason, DownloadRequest,
-    Integrity, ResourceClass, download_to_path,
+    Integrity, ProviderDownloadBatch, ResourceClass, download_to_path,
 };
 use crate::util::io;
 use crate::util::io::io_error_with_lock_info;
@@ -453,11 +453,13 @@ pub(crate) async fn install_resolved_content_plan_with_reporter(
         .cloned()
         .enumerate()
         .collect::<Vec<_>>();
+    let provider_batch = ProviderDownloadBatch::new(planned_contents.len());
     let mut downloads = futures::stream::iter(planned_contents)
         .map(|(index, content)| {
             let reporter = reporter.clone();
+            let provider_batch = provider_batch.clone();
             async move {
-                let downloaded = download_project_version_with_reporting(
+                let downloaded = download_project_version_with_batch(
                     instance_id,
                     &content.version_id,
                     if index == 0 {
@@ -468,6 +470,7 @@ pub(crate) async fn install_resolved_content_plan_with_reporter(
                     content.dependent_on_version_id.clone(),
                     None,
                     reporter,
+                    provider_batch,
                     state,
                 )
                 .await?;
@@ -1311,12 +1314,14 @@ pub(crate) async fn download_project_version(
     dependent_on_version_id: Option<String>,
     state: &State,
 ) -> crate::Result<DownloadedProjectVersion> {
-    download_project_version_with_progress(
+    download_project_version_with_batch(
         instance_id,
         version_id,
         reason,
         dependent_on_version_id,
         None,
+        None,
+        ProviderDownloadBatch::new(1),
         state,
     )
     .await
@@ -1340,13 +1345,21 @@ pub(crate) async fn download_project_version_with_progress(
     progress: Option<ResolvedContentDownloadProgress>,
     state: &State,
 ) -> crate::Result<DownloadedProjectVersion> {
-    download_project_version_with_reporting(
+    let provider_batch = ProviderDownloadBatch::new(
+        progress
+            .as_ref()
+            .map(|progress| progress.file_count as usize)
+            .unwrap_or(1)
+            .max(1),
+    );
+    download_project_version_with_batch(
         instance_id,
         version_id,
         reason,
         dependent_on_version_id,
         progress,
         None,
+        provider_batch,
         state,
     )
     .await
@@ -1358,27 +1371,30 @@ pub(crate) async fn download_project_version_with_reporter(
     reason: DownloadReason,
     dependent_on_version_id: Option<String>,
     reporter: crate::install::InstallProgressReporter,
+    provider_batch: ProviderDownloadBatch,
     state: &State,
 ) -> crate::Result<DownloadedProjectVersion> {
-    download_project_version_with_reporting(
+    download_project_version_with_batch(
         instance_id,
         version_id,
         reason,
         dependent_on_version_id,
         None,
         Some(reporter),
+        provider_batch,
         state,
     )
     .await
 }
 
-async fn download_project_version_with_reporting(
+pub(crate) async fn download_project_version_with_batch(
     instance_id: &str,
     version_id: &str,
     reason: DownloadReason,
     dependent_on_version_id: Option<String>,
     progress: Option<ResolvedContentDownloadProgress>,
     reporter: Option<crate::install::InstallProgressReporter>,
+    provider_batch: ProviderDownloadBatch,
     state: &State,
 ) -> crate::Result<DownloadedProjectVersion> {
     let prepared = prepare_version_download(
@@ -1395,7 +1411,7 @@ async fn download_project_version_with_reporting(
             std::slice::from_ref(&prepared.url),
             Some(prepared.download_meta.game_version.as_str()),
             Some(prepared.download_meta.loader.as_str()),
-            None,
+            Some(prepared.modrinth_api_latency),
         );
     let Some(primary_url) = download_urls.first() else {
         return Err(crate::ErrorKind::InputError(
@@ -1406,6 +1422,7 @@ async fn download_project_version_with_reporting(
     let mut request =
         DownloadRequest::new(primary_url, ResourceClass::Modrinth)
             .with_provider_script_policy()
+            .with_provider_batch(provider_batch)
             .with_provider_browser_headers()
             .with_exact_candidate_urls(download_urls.iter().skip(1).cloned())
             .with_integrity(integrity.clone())
@@ -1526,6 +1543,7 @@ pub(crate) struct PreparedVersionDownload {
     pub(crate) loaders: Vec<String>,
     pub(crate) project_id: String,
     pub(crate) version_id: String,
+    pub(crate) modrinth_api_latency: std::time::Duration,
 }
 
 /// Resolves the content scope and version metadata for a download and
@@ -1547,6 +1565,7 @@ pub(crate) async fn prepare_version_download(
                     scope.content_set_id
                 ))
             })?;
+    let api_started = tokio::time::Instant::now();
     let version = CachedEntry::get_version(
         &ModrinthVersionId::new(version_id.to_string())?,
         None,
@@ -1559,6 +1578,7 @@ pub(crate) async fn prepare_version_download(
             "Unable to install version id {version_id}. Not found."
         ))
     })?;
+    let modrinth_api_latency = api_started.elapsed();
     let file = version
         .files
         .iter()
@@ -1622,6 +1642,7 @@ pub(crate) async fn prepare_version_download(
         loaders: version.loaders.clone(),
         project_id: version.project_id.clone(),
         version_id: version.id.clone(),
+        modrinth_api_latency,
     })
 }
 

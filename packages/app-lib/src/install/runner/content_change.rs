@@ -277,11 +277,25 @@ async fn download_prepared_files(
 
     let worker_reporter = reporter.clone().without_phase_updates();
     let concurrency = state.download_concurrency().max(1);
+    let modrinth_batch = crate::util::fetch::ProviderDownloadBatch::new(
+        files
+            .iter()
+            .filter(|file| file.provider == ContentProvider::Modrinth)
+            .count(),
+    );
+    let curseforge_batch = crate::util::fetch::ProviderDownloadBatch::new(
+        files
+            .iter()
+            .filter(|file| file.provider == ContentProvider::CurseForge)
+            .count(),
+    );
     let mut downloads = spawn_bounded(
         files.into_iter().map(|file| {
             let reporter = worker_reporter.clone();
             let instance_id = instance_id.to_string();
             let state = state.clone();
+            let modrinth_batch = modrinth_batch.clone();
+            let curseforge_batch = curseforge_batch.clone();
             async move {
                 if file.manual_download_url.is_some() && file.urls.is_empty() {
                     return (
@@ -304,6 +318,7 @@ async fn download_prepared_files(
 						},
 						None,
 						reporter,
+						modrinth_batch,
 						&state,
 					)
 					.await
@@ -320,6 +335,7 @@ async fn download_prepared_files(
 								file_id,
 								None,
 								Some(&reporter),
+								curseforge_batch,
 							)
 							.await
 								.map(DownloadedContent::CurseForge)
