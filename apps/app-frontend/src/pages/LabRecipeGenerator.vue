@@ -1242,17 +1242,13 @@ function buildDatapackFiles(): PackFile[] | null {
 async function installDatapackToWorld(target: { instanceId: string; worldPath: string }) {
     const pending = pendingDatapack.value
     if (!pending) return
-    try {
-        await exportDatapackToWorld(
-            target.instanceId,
-            target.worldPath,
-            pending.files,
-            pending.fileName,
-        )
-        addNotification({ type: 'success', title: formatMessage(messages.exportDatapackDone) })
-    } catch (error) {
-        handleError(error)
-    }
+    await exportDatapackToWorld(
+        target.instanceId,
+        target.worldPath,
+        pending.files,
+        pending.fileName,
+    )
+    addNotification({ type: 'success', title: formatMessage(messages.exportDatapackDone) })
 }
 
 function sidebarTitle(recipe: RecipeState): string {
@@ -1845,7 +1841,7 @@ function slotEditorSlots(type: RecipeType): RecipeSlot[] {
         <RecipeGeneratorCopyrightModal ref="copyrightModal" />
         <InstanceExportModal
             ref="instanceExportModal"
-            @select="installDatapackToWorld"
+            :on-install="installDatapackToWorld"
             @save-as="saveAs"
         />
     </main>
