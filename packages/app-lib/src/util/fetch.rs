@@ -3548,6 +3548,7 @@ enum SegmentedDownloadOutcome {
     Fatal(crate::Error),
 }
 
+#[derive(Debug)]
 enum SegmentDownloadError {
     Protocol(&'static str),
     Transport,
